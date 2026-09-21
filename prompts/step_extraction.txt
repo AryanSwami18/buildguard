@@ -1,0 +1,4 @@
+Interpret the supplied Bash syntax structurally and semantically. Do not assume
+that a command name always has one meaning. Use the complete source context,
+surrounding steps, and AST relationships. Return one JSON object matching the
+BuildStep schema exactly. Keep the supplied id, order, and source context.

@@ -1,0 +1,13 @@
+[project]
+name = "buildguard-ai"
+version = "0.1.0"
+description = "Compare build documentation with Bash automation using structured AI interpretation."
+requires-python = ">=3.11"
+dependencies = ["bashlex>=0.18", "pydantic>=2.0", "python-dotenv>=1.2"]
+
+[project.scripts]
+buildguard-docs = "app.docs_cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
