@@ -8,6 +8,7 @@ from app.models.build import BuildInstruction
 from app.models.step import BuildStep
 from app.parsers.bash_normalizer import normalize_bash
 from app.parsers.bash_parser import parse_script
+from app.parsers.semantic_parser import parse_semantic_facts
 from app.parsers.wiki_parser import parse_wiki
 from app.pipeline.context import neighbouring_text, step_context
 from app.sources.github import GitHubSource, GitHubWikiPage
@@ -51,9 +52,14 @@ class BuildPipeline:
 
     def from_wiki(self, markdown: str, name: str = "wiki") -> BuildInstruction:
         document = parse_wiki(markdown, name)
+        semantic_facts = parse_semantic_facts(markdown)
         request = self._request(
             prompt_name="wiki_extraction.txt",
-            source={"source": "wiki", "document": document.model_dump(mode="json")},
+            source={
+                "source": "wiki",
+                "document": document.model_dump(mode="json"),
+                "semantic_facts": semantic_facts.model_dump(mode="json"),
+            },
             context={
                 "source_type": "wiki",
                 "source_name": name,
@@ -101,6 +107,12 @@ class BuildPipeline:
                 index=index,
                 section=block.section,
                 subsection=block.subsection,
+                heading_path=block.heading_path,
+                logical_section=block.logical_section,
+                logical_subsection=block.logical_subsection,
+                logical_heading_path=block.logical_heading_path,
+                context_labels=block.context_labels,
+                conditions=block.conditions,
                 location=f"lines {block.line_start}-{block.line_end}",
                 line_start=block.line_start,
                 line_end=block.line_end,
@@ -179,6 +191,8 @@ class BuildPipeline:
                 "source": source["source"],
                 "document": source["document"],
             }
+            if "semantic_facts" in source:
+                request_source["semantic_facts"] = source["semantic_facts"]
         else:
             request_source = {"source": source, "context": context}
         user_prompt = json.dumps(

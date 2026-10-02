@@ -120,3 +120,4 @@ def test_wiki_pipeline_reports_empty_or_invalid_provider_json(content: str, mess
 
     with pytest.raises(RuntimeError, match=message):
         BuildPipeline(InvalidProvider()).from_wiki("# Setup\n\nInstall Java.\n", "guide.md")
+

@@ -2,7 +2,18 @@ from app.parsers.wiki_parser import parse_wiki
 
 
 def test_wiki_parser_keeps_headings_order_and_code_block_locations() -> None:
-    markdown = """# Install\n\nInstall Java.\n\n## Application\n\nCreate the Alfresco user.\n\n```bash\nmkdir -p /opt/alfresco\n```\n"""
+    markdown = """# Install
+
+Install Java.
+
+## Application
+
+Create the Alfresco user.
+
+```bash
+mkdir -p /opt/alfresco
+```
+"""
 
     document = parse_wiki(markdown, "guide")
 
@@ -43,3 +54,51 @@ Introductory text.
     assert document.blocks[1].line_start == document.blocks[1].line_end == 5
     assert document.blocks[3].section == "Prepare"
     assert document.blocks[3].subsection == "Verify"
+
+
+def test_wiki_parser_preserves_logical_build_context_across_context_h1_headings() -> None:
+    markdown = """# Building Alfresco
+
+### 3. Build component docker images
+
+#### 3.1 base-java
+
+# Execute the Build Command
+
+```bash
+docker build -t alfresco/base-java:17 .
+```
+
+#### 3.2 base-tomcat
+
+# Only if Building for Rhel Distributions
+
+```bash
+# For RHEL only
+yum install -y gcc
+```
+"""
+
+    document = parse_wiki(markdown, "Building-Alfresco.md")
+
+    first = document.blocks[0]
+    second = document.blocks[1]
+
+    assert first.heading_path == ["Execute the Build Command"]
+    assert first.logical_section == "3. Build component docker images"
+    assert first.logical_subsection == "3.1 base-java"
+    assert first.logical_heading_path == [
+        "3. Build component docker images",
+        "3.1 base-java",
+    ]
+    assert first.context_labels == ["Execute the Build Command"]
+    assert first.conditions == []
+
+    assert second.logical_section == "3. Build component docker images"
+    assert second.logical_subsection == "3.2 base-tomcat"
+    assert second.context_labels == ["Only if Building for Rhel Distributions"]
+    assert second.conditions == [
+        "Only if Building for Rhel Distributions",
+        "For RHEL only",
+    ]
+

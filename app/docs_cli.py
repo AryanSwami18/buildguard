@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from app.config.settings import Settings
 from app.github.client import GitHubClient
 from app.intelligence.factory import create_provider
+from app.parsers.semantic_parser import parse_semantic_facts
 from app.parsers.wiki_parser import parse_wiki
 from app.pipeline.build_pipeline import BuildPipeline
 
@@ -21,9 +22,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         page = GitHubClient.from_settings(settings).fetch_module_wiki(arguments.module)
         document = parse_wiki(page.content, page.filename)
+        semantic_facts = parse_semantic_facts(page.content)
         result: dict[str, object] = {
             "source": page.model_dump(mode="json", exclude={"content"}),
             "document": document.model_dump(mode="json"),
+            "semantic_facts": semantic_facts.model_dump(mode="json"),
         }
         if arguments.with_ai:
             instruction = BuildPipeline(create_provider(settings)).from_github_wiki(page)
