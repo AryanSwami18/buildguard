@@ -5,11 +5,15 @@ from app.sources.github import GitHubSource
 
 
 class BuildInstruction(BaseModel):
-    """An ordered build procedure from one documentation or automation source."""
+    """An ordered build procedure from one source."""
 
     name: str
     source: str
+
     version: str | None = None
+
     source_metadata: GitHubSource | None = None
 
-    steps: list[BuildStep] = Field(default_factory=list)
+    steps: list[BuildStep] = Field(
+        default_factory=list
+    )

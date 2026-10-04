@@ -20,8 +20,17 @@ class SourceContext(BaseModel):
 
     surrounding_text: str | None = None
 
+    # Exact source block used to validate a Wiki interpretation.
+    source_excerpt: str | None = None
+
+    # Explicit source qualifiers such as "Only if building for RHEL".
+    conditions: list[str] = Field(default_factory=list)
+
+    # Script-level options/defaults relevant to parameterized operations.
+    runtime_options: dict[str, list[str]] = Field(default_factory=dict)
+    runtime_defaults: dict[str, str] = Field(default_factory=dict)
+
     previous_step_id: str | None = None
     next_step_id: str | None = None
 
     related_step_ids: list[str] = Field(default_factory=list)
-

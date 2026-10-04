@@ -13,6 +13,9 @@ from urllib.request import Request, urlopen
 from app.config.settings import Settings
 from app.sources.github import GitHubDirectoryEntry, GitHubFile, GitHubWikiPage
 
+GITHUB_REQUEST_TIMEOUT_SECONDS = 30
+WIKI_CLONE_TIMEOUT_SECONDS = 60
+
 
 class GitHubClient:
     """Retrieve GitHub sources without making assumptions about their contents."""
@@ -89,7 +92,7 @@ class GitHubClient:
                     }
                 )
             try:
-                subprocess.run(command, check=True, capture_output=True, text=True, env=environment)
+                self._run_wiki_clone(command, environment)
             except (OSError, subprocess.CalledProcessError) as error:
                 # A stale token should not prevent access to a public Wiki. Retry
                 # anonymously before reporting the clone failure.
@@ -98,13 +101,7 @@ class GitHubClient:
                     for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
                         anonymous_environment.pop(key, None)
                     try:
-                        subprocess.run(
-                            command,
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            env=anonymous_environment,
-                        )
+                        self._run_wiki_clone(command, anonymous_environment)
                     except (OSError, subprocess.CalledProcessError) as retry_error:
                         error = retry_error
                     else:
@@ -156,8 +153,32 @@ class GitHubClient:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         request = Request(url, headers=headers)
-        with urlopen(request) as response:  # noqa: S310 - URL is constructed from caller input.
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(
+                request,
+                timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+            ) as response:  # noqa: S310 - URL is constructed from caller input.
+                return json.loads(response.read().decode("utf-8"))
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"GitHub request timed out after {GITHUB_REQUEST_TIMEOUT_SECONDS} seconds"
+            ) from error
+
+    @staticmethod
+    def _run_wiki_clone(command: list[str], environment: dict[str, str]) -> None:
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=WIKI_CLONE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"GitHub Wiki clone timed out after {WIKI_CLONE_TIMEOUT_SECONDS} seconds"
+            ) from error
 
     def _contents_url(self, repository: str, path: str, ref: str) -> str:
         repository_path = quote(repository, safe="/")
@@ -195,3 +216,46 @@ class GitHubClient:
             ),
             kind="directory" if entry_type == "dir" else "file",
         )
+
+    def fetch_build_script(
+        self,
+        repository: str,
+        product: str,
+        version: str,
+        ref: str | None = None,
+    ) -> GitHubFile:
+        """Find and fetch the build shell script for a product/version."""
+        resolved_ref = self._resolve_ref(ref)
+        product_path = product.strip().strip("/")
+        if not product_path:
+            raise ValueError("Script product name cannot be empty")
+
+        version_path = f"{product_path}/{version}"
+        entries = self.list_path(repository, version_path, resolved_ref)
+        shell_files = [
+            entry
+            for entry in entries
+            if entry.kind == "file" and entry.filename.lower().endswith(".sh")
+        ]
+
+        if not shell_files:
+            raise ValueError(
+                f"No shell script found in {repository}/{version_path}"
+            )
+
+        expected_name = f"build_{PurePosixPath(product_path).name.lower()}.sh"
+        matching = [
+            entry for entry in shell_files
+            if entry.filename.lower() == expected_name
+        ]
+        if len(matching) == 1:
+            selected = matching[0]
+        elif len(shell_files) == 1:
+            selected = shell_files[0]
+        else:
+            names = ", ".join(entry.filename for entry in shell_files)
+            raise ValueError(
+                f"Multiple shell scripts found in {repository}/{version_path}: {names}"
+            )
+
+        return self.fetch_file(repository, selected.path, resolved_ref)

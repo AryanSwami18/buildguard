@@ -1,0 +1,57 @@
+You compare an extracted build Wiki instruction with an extracted Bash build script.
+
+Use only the two supplied BuildInstruction objects. Do not use external knowledge,
+rewrite either instruction, or infer that two steps match just because their
+descriptions sound generally similar.
+
+Compare every step in both inputs. Match steps only when they describe the same
+build operation, accounting for action, packages, commands, paths, URLs,
+repository, ref, commit, version, Docker image, Dockerfile, build arguments,
+environment, patches, build tool, dependencies, and source context. Equivalent
+shell syntax or different wording can represent the same operation. Preserve
+differences in concrete values as conflicts; do not silently treat them as equal.
+
+For each Wiki step, return exactly one entry. A Wiki instruction may require
+several Bash commands; include every Bash step needed to carry out that Wiki
+instruction in `bash_step_ids`. Set `bash_step_id` to the first/primary ID for
+compatibility, and include that same ID in `bash_step_ids`.
+- matched: the Bash script implements the same operation and its concrete values
+  agree where both sources provide them.
+- conflict: the same operation is present but there is a meaningful action or
+  value disagreement.
+- missing: no Bash step implements the Wiki operation.
+- out_of_scope: the Wiki step only downloads or launches the same build script
+  whose internal commands are being compared. The script does not implement its
+  own bootstrap step; explain why it is outside this comparison.
+
+For a missing step, use null for `bash_step_id` and an empty `bash_step_ids`
+array. Use the same empty Bash fields for an out_of_scope step. A parameterized Bash step may support multiple Wiki variants when its
+variables or conditions explicitly allow those values; it may be referenced by
+more than one Wiki entry in that case. Do not reuse other Bash IDs. For each Bash
+step not referenced by any Wiki entry, return one extra entry. Preserve all IDs
+exactly as supplied.
+
+Accuracy rules:
+- Follow Bash variables, explicit defaults, conditions, and function context
+  before deciding that an operation or value is absent.
+- Use any `runtime_options` and `runtime_defaults` in Bash context as source
+  evidence for parameterized Java operations. A listed Java choice proves the
+  script accepts that choice, but verify that its implementation supports the
+  Wiki's requested distribution and installation method too. The default is
+  the selection used when the user does not override it.
+- A configurable value such as `${jver}` is not a conflict merely because it is
+  written as a variable. Resolve an explicit default where available. If the
+  script explicitly supports the Wiki value as an option, treat that Wiki
+  variant as implemented even when another option is the default.
+- Mark a step missing only after checking all Bash steps for equivalent
+  commands, helper functions, and multi-command implementations.
+- Mark a Bash step extra only when it is an undocumented build operation or
+  materially changes build behavior. Do not report assignments, navigation,
+  retries, logging, cleanup, or control-flow plumbing as standalone extras.
+- State a conflict only when the supplied source data shows the concrete
+  disagreement. If the result depends on a user-selected option, say so in the
+  explanation instead of describing it as an unconditional difference.
+
+Return only valid JSON matching the supplied expected_output schema. The summary
+should state the overall comparison result briefly. Each entry explanation
+should name the meaningful agreement or discrepancy, and must not invent facts.

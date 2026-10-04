@@ -6,7 +6,8 @@ from app.sources.wiki import WikiBlock, WikiDocument, WikiHeading
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _NUMBERED_ITEM = re.compile(r"^\s*\d+[.)]\s+.*$")
 _BULLET_ITEM = re.compile(r"^\s*[-+*]\s+.*$")
-_CODE_FENCE = re.compile(r"^\s*```")
+_CODE_FENCE = re.compile(r"^ {0,3}```")
+_INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
 
 # Numbered Build Instruction headings such as:
 #   3. Build component docker images
@@ -263,6 +264,10 @@ def parse_wiki(markdown: str, name: str) -> WikiDocument:
     in_code_block = False
     code_lines: list[str] = []
     code_start: int | None = None
+    in_indented_code = False
+    indented_code_lines: list[str] = []
+    indented_code_start: int | None = None
+    indented_code_end: int | None = None
 
     def flush_paragraph(end_line: int) -> None:
         nonlocal paragraph_lines, paragraph_start
@@ -298,7 +303,50 @@ def parse_wiki(markdown: str, name: str) -> WikiDocument:
         if block is not None:
             blocks.append(block)
 
+    def flush_indented_code() -> None:
+        nonlocal in_indented_code
+        nonlocal indented_code_lines
+        nonlocal indented_code_start
+        nonlocal indented_code_end
+
+        if indented_code_start is not None and indented_code_end is not None:
+            block = _make_block(
+                kind="code_block",
+                lines=indented_code_lines,
+                start_line=indented_code_start,
+                end_line=indented_code_end,
+                headings=headings,
+            )
+
+            if block is not None:
+                blocks.append(block)
+
+        in_indented_code = False
+        indented_code_lines = []
+        indented_code_start = None
+        indented_code_end = None
+
     for index, line in enumerate(lines, start=1):
+        if in_indented_code:
+            if _INDENTED_CODE.match(line):
+                indented_code_lines.append(line)
+                indented_code_end = index
+                continue
+
+            if not line.strip():
+                next_line_is_indented = (
+                    index < len(lines)
+                    and _INDENTED_CODE.match(lines[index]) is not None
+                )
+                if next_line_is_indented:
+                    indented_code_lines.append(line)
+                    continue
+
+                flush_indented_code()
+                continue
+
+            flush_indented_code()
+
         if _CODE_FENCE.match(line):
             if not in_code_block:
                 flush_paragraph(index - 1)
@@ -327,6 +375,14 @@ def parse_wiki(markdown: str, name: str) -> WikiDocument:
 
         if in_code_block:
             code_lines.append(line)
+            continue
+
+        if _INDENTED_CODE.match(line):
+            flush_paragraph(index - 1)
+            in_indented_code = True
+            indented_code_start = index
+            indented_code_end = index
+            indented_code_lines = [line]
             continue
 
         heading_match = _HEADING.match(line)
@@ -365,6 +421,8 @@ def parse_wiki(markdown: str, name: str) -> WikiDocument:
 
         if block is not None:
             blocks.append(block)
+    elif in_indented_code:
+        flush_indented_code()
     else:
         flush_paragraph(len(lines))
 
@@ -374,5 +432,3 @@ def parse_wiki(markdown: str, name: str) -> WikiDocument:
         headings=headings,
         blocks=blocks,
     )
-
-

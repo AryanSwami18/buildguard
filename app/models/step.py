@@ -21,6 +21,12 @@ class ActionType(str, Enum):
 
     RUN_COMMAND = "run_command"
 
+    CLONE_REPOSITORY = "clone_repository"
+    CHECKOUT_SOURCE = "checkout_source"
+    APPLY_PATCH = "apply_patch"
+    BUILD_IMAGE = "build_image"
+    RUN_TEST = "run_test"
+
     CREATE_USER = "create_user"
     MODIFY_USER = "modify_user"
 

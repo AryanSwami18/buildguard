@@ -5,26 +5,23 @@ automation. It first retains each source's syntax and context, then delegates
 semantic interpretation to an injected LLM provider.
 
 ```text
-Markdown / Bash
-    -> source structure (Markdown blocks / bashlex AST)
-    -> source and neighbouring-step context
-    -> generic LLM request
-    -> Pydantic-validated BuildStep
-    -> contextual comparison report
+Wiki Markdown -> document structure and source facts -> LLM -> validated BuildSteps
+Bash script   -> bashlex AST -> deterministic command semantics -> BuildSteps
+              -> contextual comparison report
 ```
 
 ## Design
 
-- Bash is parsed by `bashlex`. The parser records nodes, nesting, operators,
-  words, exact source text, and character positions. It contains no rules for
-  `dnf`, `wget`, `tar`, or any other command.
-- Markdown parsing keeps headings, paragraphs, code blocks, locations, and
-  document order. It does not split documentation into unrelated sentences.
+- Bash syntax is parsed by `bashlex`; a semantic pass then identifies commands,
+  packages, repositories, Docker images, paths, and other explicit values.
+- Markdown parsing keeps headings, paragraphs, fenced or indented code blocks,
+  locations, and document order. It does not split documentation into unrelated
+  sentences.
 - `BuildPipeline` accepts an `LLMProvider`, a small protocol with one
   `generate(LLMRequest) -> LLMResponse` method. No provider SDK is imported by
   application code.
-- The provider returns structured JSON-like data. Pydantic validates it as a
-  shared `BuildStep`, so Wiki and Bash output use the same model.
+- The provider returns structured JSON-like data for Wiki extraction. Pydantic
+  validates both Wiki and Bash results with the shared `BuildStep` model.
 
 ## Using the core pipeline
 
@@ -55,34 +52,42 @@ Pydantic validates each returned step. The provider supplies the semantic
 fields such as action, description, dependencies, packages, paths, URLs, and
 execution context.
 
-## Parse documentation from GitHub Wiki
+## Run the Wiki and Bash pipeline
 
-The default source is the [Building Alfresco Wiki page](https://github.com/AryanSwami18/docs/wiki/Building-Alfresco).
-Set `GITHUB_TOKEN` when accessing a private Wiki, or set `GITHUB_REPO` to use a
-different documentation repository. Do not commit `.env`.
-
-Fetch a module page and print the complete Markdown structure as JSON:
-
-```bash
-python -m app.docs_cli
-```
-
-The JSON includes source metadata plus the complete parsed document: original
-content, headings, and ordered paragraphs, list steps, and code blocks with
-their section and line locations. To additionally ask OpenRouter to turn the
-complete Wiki document into one validated `BuildInstruction`, set
-`OPENROUTER_API_KEY` and run:
+The default sources are the [Build Instructions Wiki](https://github.com/AryanSwami18/docs/wiki)
+and the versioned scripts in `AryanSwami18/scripts`. Set `GITHUB_REPO`,
+`SCRIPTS_REPO`, `GITHUB_BRANCH`, or `SCRIPTS_BRANCH` to select other sources.
+BuildGuard uses a local Ollama model by default, so Wiki extraction and
+comparison do not require an AI API key. Install and pull the recommended model
+once:
 
 ```bash
-python -m app.docs_cli "Module name" --with-ai
+ollama pull qwen3.5:4b-q4_K_M
 ```
 
-With `--with-ai`, the complete parsed Wiki document is sent in one structured
-request and the command prints the resulting `BuildInstruction` under
-`extracted_steps`. The same command is available through `python -m app.main`.
+Ollama must be running locally. BuildGuard uses
+[`qwen3.5:4b-q4_K_M`](https://ollama.com/library/qwen3.5) by default. Set
+`OLLAMA_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT_SECONDS`,
+`OLLAMA_MAX_OUTPUT_TOKENS`, or `OLLAMA_CONTEXT_TOKENS` to change the local
+configuration. The default context is 32K tokens and output limit is 16384
+tokens. Ollama receives the expected JSON Schema for constrained responses.
 
-After installation, the equivalent command is `buildguard-docs "Module name"`.
-This documentation command deliberately does not fetch or compare scripts.
+To use Gemini instead, set `AI_PROVIDER=gemini` and `GEMINI_API_KEY`. Set
+`GEMINI_MODEL` to choose another Gemini model. Set `GITHUB_TOKEN` when the
+repositories are private. Keep credentials in `.env`; do not commit it.
+
+Run a module by its Wiki page name, without the `.md` suffix:
+
+```bash
+python -m app.main Building-Alfresco
+```
+
+The command finds the product version in the Wiki, extracts the Wiki steps with
+AI, fetches and parses the corresponding script, then asks AI to compare both
+validated instructions. Large Wiki pages are extracted in smaller chunks. The
+command prints only mismatches, with source locations and excerpts, to stdout;
+matched steps are omitted. Progress and errors go to stderr. The installed
+command is also available as `buildguard-docs`.
 
 ## Tests
 

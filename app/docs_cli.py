@@ -1,4 +1,6 @@
-"""Documentation-only command line entry point for BuildGuard AI."""
+"""BuildGuard AI command line pipeline."""
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -9,50 +11,150 @@ from dotenv import load_dotenv
 from app.config.settings import Settings
 from app.github.client import GitHubClient
 from app.intelligence.factory import create_provider
-from app.parsers.semantic_parser import parse_semantic_facts
-from app.parsers.wiki_parser import parse_wiki
+from app.models.build import BuildInstruction
+from app.parsers.bash_semantic_parser import parse_bash_steps
+from app.parsers.version_parser import extract_version, product_from_module
 from app.pipeline.build_pipeline import BuildPipeline
+from app.reporting.reporter import render_report
+from app.sources.github import GitHubSource
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Fetch and fully parse one configured GitHub Wiki module page."""
+    """Run the BuildGuard Wiki + Bash parsing pipeline."""
     arguments = _arguments(argv)
+
     load_dotenv()
-    settings = Settings()
+
     try:
-        page = GitHubClient.from_settings(settings).fetch_module_wiki(arguments.module)
-        document = parse_wiki(page.content, page.filename)
-        semantic_facts = parse_semantic_facts(page.content)
-        result: dict[str, object] = {
-            "source": page.model_dump(mode="json", exclude={"content"}),
-            "document": document.model_dump(mode="json"),
-            "semantic_facts": semantic_facts.model_dump(mode="json"),
-        }
-        if arguments.with_ai:
-            instruction = BuildPipeline(create_provider(settings)).from_github_wiki(page)
-            result["extracted_steps"] = instruction.model_dump(mode="json")
-        print(json.dumps(result, indent=2))
-        return 0
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
-        print(f"buildguard-docs: {error}", file=sys.stderr)
+        settings = Settings()
+        return _run_pipeline(
+            module=arguments.module,
+            settings=settings,
+        )
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        print(f"buildguard: {error}", file=sys.stderr)
         return 1
 
 
-def _arguments(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Fetch and structurally parse a BuildGuard documentation Wiki page."
+def _run_pipeline(
+    module: str,
+    settings: Settings,
+) -> int:
+    """Fetch, parse, and display the Wiki and matching Bash script."""
+
+    github = GitHubClient.from_settings(settings)
+    print(f"Fetching Wiki module '{module}'...", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # 1. Fetch and parse the Build Instruction Wiki
+    # ------------------------------------------------------------------
+
+    page = github.fetch_module_wiki(module)
+
+    # ------------------------------------------------------------------
+    # 2. Determine product and version from the Wiki
+    # ------------------------------------------------------------------
+
+    product = product_from_module(module)
+
+    version = extract_version(
+        page.content,
+        product,
     )
+
+    if version is None:
+        raise ValueError(
+            f"Could not determine the product version from Wiki module "
+            f"'{module}'."
+        )
+
+    provider = create_provider(settings)
+    pipeline = BuildPipeline(
+        provider,
+        progress=lambda message: print(message, file=sys.stderr),
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Convert the Wiki into a BuildInstruction
+    # ------------------------------------------------------------------
+
+    print("Extracting Wiki build instructions with AI...", file=sys.stderr)
+    wiki_instruction = pipeline.from_github_wiki(
+        page,
+        version=version,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Find the matching versioned Bash script
+    # ------------------------------------------------------------------
+
+    print(f"Fetching {product} {version} build script...", file=sys.stderr)
+    script_file = github.fetch_build_script(
+        repository=settings.scripts_repo,
+        product=product,
+        version=version,
+        ref=settings.scripts_branch,
+    )
+
+    bash_steps = parse_bash_steps(
+        script_file.content,
+        script_file.filename,
+    )
+
+    bash_instruction = BuildInstruction(
+        name=script_file.filename,
+        source="bash",
+        version=version,
+        source_metadata=GitHubSource.model_validate(
+            script_file.model_dump()
+        ),
+        steps=bash_steps,
+    )
+
+    print(
+        "Comparing Wiki instructions with the build script using AI...",
+        file=sys.stderr,
+    )
+    comparison = pipeline.compare(wiki_instruction, bash_instruction)
+    print(
+        render_report(
+            comparison,
+            f"{product} {version}",
+            script_name=script_file.filename,
+        )
+    )
+
+    return 0
+
+
+def _arguments(
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
+    """Parse command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Parse a BuildGuard Wiki instruction and its "
+            "matching Bash automation script."
+        )
+    )
+
     parser.add_argument(
         "module",
         nargs="?",
         default="Building-Alfresco",
-        help="GitHub Wiki page/module name, without the .md suffix (default: Building-Alfresco)",
+        help=(
+            "Build Instruction Wiki module, "
+            "for example Building-Alfresco "
+            "(default: Building-Alfresco)"
+        ),
     )
-    parser.add_argument(
-        "--with-ai",
-        action="store_true",
-        help="also extract one Pydantic-validated BuildInstruction through OpenRouter",
-    )
+
     return parser.parse_args(argv)
 
 
