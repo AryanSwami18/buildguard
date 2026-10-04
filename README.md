@@ -76,18 +76,43 @@ To use Gemini instead, set `AI_PROVIDER=gemini` and `GEMINI_API_KEY`. Set
 `GEMINI_MODEL` to choose another Gemini model. Set `GITHUB_TOKEN` when the
 repositories are private. Keep credentials in `.env`; do not commit it.
 
-Run a module by its Wiki page name, without the `.md` suffix:
+Run one package by its name, or pass its explicit Wiki module name:
 
 ```bash
+python -m app.main Alfresco
+# Equivalent:
 python -m app.main Building-Alfresco
 ```
 
 The command finds the product version in the Wiki, extracts the Wiki steps with
 AI, fetches and parses the corresponding script, then asks AI to compare both
 validated instructions. Large Wiki pages are extracted in smaller chunks. The
-command prints only mismatches, with source locations and excerpts, to stdout;
-matched steps are omitted. Progress and errors go to stderr. The installed
-command is also available as `buildguard-docs`.
+report contains only discrepancies, with source locations, source evidence,
+categories, and suggested corrections; successful matches are omitted. The
+default Markdown report can be changed to JSON or standalone HTML, and saved to
+a file:
+
+```bash
+python -m app.main Alfresco --format json --output report.json
+python -m app.main Alfresco --format html --output report.html
+```
+
+Progress and errors go to stderr. The installed command is available as
+`buildguard`; `buildguard-docs` remains as a compatibility alias.
+
+## Streamlit interface
+
+Install project dependencies, then launch the web interface from the project
+root:
+
+```bash
+pip install -e .
+streamlit run streamlit_app.py
+```
+
+Enter one package or Wiki module, run the comparison, and review the
+mismatch-only report in the browser. The download control exports the same
+report as Markdown, JSON, or standalone HTML.
 
 ## Tests
 

@@ -1,12 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "buildguard-ai"
 version = "0.1.0"
 description = "Compare build documentation with Bash automation using structured AI interpretation."
 requires-python = ">=3.11"
-dependencies = ["bashlex>=0.18", "pydantic>=2.0", "python-dotenv>=1.2"]
+dependencies = [
+    "bashlex>=0.18",
+    "pydantic>=2.0",
+    "python-dotenv>=1.2",
+    "streamlit>=1.37,<2",
+]
 
 [project.scripts]
+buildguard = "app.docs_cli:main"
 buildguard-docs = "app.docs_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["tests*", "prompts*"]
+namespaces = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

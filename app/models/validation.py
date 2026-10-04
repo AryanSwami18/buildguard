@@ -13,12 +13,29 @@ class MatchStatus(str, Enum):
     OUT_OF_SCOPE = "out_of_scope"
 
 
+class DiscrepancyCategory(str, Enum):
+    """Kinds of actionable differences in a Wiki/script comparison."""
+
+    MISSING_STEP = "missing_step"
+    UNDOCUMENTED_STEP = "undocumented_step"
+    PARAMETER_VALUE_MISMATCH = "parameter_value_mismatch"
+    VERSION_INCONSISTENCY = "version_inconsistency"
+    DEPENDENCY_INCONSISTENCY = "dependency_inconsistency"
+    COMMAND_MISMATCH = "command_mismatch"
+    CONFIGURATION_MISMATCH = "configuration_mismatch"
+    OTHER_DEVIATION = "other_deviation"
+
+
 class StepMatch(BaseModel):
     wiki_step: BuildStep | None = None
     automation_step: BuildStep | None = None
     automation_steps: list[BuildStep] = Field(default_factory=list)
 
     status: MatchStatus
+
+    category: DiscrepancyCategory | None = None
+
+    recommendation: str | None = None
 
     explanation: str
 
@@ -39,6 +56,8 @@ class AIComparisonMatch(BaseModel):
     wiki_step_id: str | None
     bash_step_id: str | None
     bash_step_ids: list[str] = Field(default_factory=list)
+    category: DiscrepancyCategory | None = None
+    recommendation: str | None = None
 
 
 class AIComparisonResult(BaseModel):

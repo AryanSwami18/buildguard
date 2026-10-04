@@ -26,6 +26,13 @@ when its variables or conditions explicitly support each variant. Do not reuse
 other Bash IDs. Preserve IDs exactly. Do not return extra entries; the
 application determines which unused Bash steps are extra after all batches.
 
+For every missing or conflict entry, provide a `category` and a concise,
+actionable `recommendation`. Categories are `missing_step`,
+`parameter_value_mismatch`, `version_inconsistency`,
+`dependency_inconsistency`, `command_mismatch`, `configuration_mismatch`, or
+`other_deviation`. Recommendations must use only values supported by the
+supplied Wiki and Bash evidence. For matched entries, set both fields to null.
+
 Accuracy rules:
 - Follow supplied Bash variables, defaults, conditions, and function context
   before deciding that an operation or value is absent.

@@ -5,18 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from app.config.settings import Settings
-from app.github.client import GitHubClient
-from app.intelligence.factory import create_provider
-from app.models.build import BuildInstruction
-from app.parsers.bash_semantic_parser import parse_bash_steps
-from app.parsers.version_parser import extract_version, product_from_module
-from app.pipeline.build_pipeline import BuildPipeline
 from app.reporting.reporter import render_report
-from app.sources.github import GitHubSource
+from app.service import run_package_comparison
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,8 +23,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = Settings()
         return _run_pipeline(
-            module=arguments.module,
+            package=arguments.package,
             settings=settings,
+            output_format=arguments.format,
+            output_path=arguments.output,
         )
     except (
         OSError,
@@ -42,92 +39,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_pipeline(
-    module: str,
+    package: str,
     settings: Settings,
+    output_format: str = "markdown",
+    output_path: str | None = None,
 ) -> int:
-    """Fetch, parse, and display the Wiki and matching Bash script."""
-
-    github = GitHubClient.from_settings(settings)
-    print(f"Fetching Wiki module '{module}'...", file=sys.stderr)
-
-    # ------------------------------------------------------------------
-    # 1. Fetch and parse the Build Instruction Wiki
-    # ------------------------------------------------------------------
-
-    page = github.fetch_module_wiki(module)
-
-    # ------------------------------------------------------------------
-    # 2. Determine product and version from the Wiki
-    # ------------------------------------------------------------------
-
-    product = product_from_module(module)
-
-    version = extract_version(
-        page.content,
-        product,
-    )
-
-    if version is None:
-        raise ValueError(
-            f"Could not determine the product version from Wiki module "
-            f"'{module}'."
-        )
-
-    provider = create_provider(settings)
-    pipeline = BuildPipeline(
-        provider,
+    """Run and render one package's Build Instructions/script comparison."""
+    report = run_package_comparison(
+        package,
+        settings,
         progress=lambda message: print(message, file=sys.stderr),
     )
-
-    # ------------------------------------------------------------------
-    # 3. Convert the Wiki into a BuildInstruction
-    # ------------------------------------------------------------------
-
-    print("Extracting Wiki build instructions with AI...", file=sys.stderr)
-    wiki_instruction = pipeline.from_github_wiki(
-        page,
-        version=version,
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Find the matching versioned Bash script
-    # ------------------------------------------------------------------
-
-    print(f"Fetching {product} {version} build script...", file=sys.stderr)
-    script_file = github.fetch_build_script(
-        repository=settings.scripts_repo,
-        product=product,
-        version=version,
-        ref=settings.scripts_branch,
-    )
-
-    bash_steps = parse_bash_steps(
-        script_file.content,
-        script_file.filename,
-    )
-
-    bash_instruction = BuildInstruction(
-        name=script_file.filename,
-        source="bash",
-        version=version,
-        source_metadata=GitHubSource.model_validate(
-            script_file.model_dump()
-        ),
-        steps=bash_steps,
-    )
-
-    print(
-        "Comparing Wiki instructions with the build script using AI...",
-        file=sys.stderr,
-    )
-    comparison = pipeline.compare(wiki_instruction, bash_instruction)
-    print(
-        render_report(
-            comparison,
-            f"{product} {version}",
-            script_name=script_file.filename,
-        )
-    )
+    rendered_report = render_report(report, output_format)
+    if output_path:
+        destination = Path(output_path).expanduser()
+        destination.write_text(rendered_report + "\n", encoding="utf-8")
+        print(f"Wrote {output_format} discrepancy report to {destination}", file=sys.stderr)
+    else:
+        print(rendered_report)
 
     return 0
 
@@ -139,20 +68,30 @@ def _arguments(
 
     parser = argparse.ArgumentParser(
         description=(
-            "Parse a BuildGuard Wiki instruction and its "
-            "matching Bash automation script."
+            "Compare a package's Build Instructions with its versioned Bash "
+            "automation script and report discrepancies."
         )
     )
 
     parser.add_argument(
-        "module",
+        "package",
         nargs="?",
-        default="Building-Alfresco",
+        default="Alfresco",
         help=(
-            "Build Instruction Wiki module, "
-            "for example Building-Alfresco "
-            "(default: Building-Alfresco)"
+            "package name (for example Alfresco) or Wiki module name "
+            "(for example Building-Alfresco; default: Alfresco)"
         ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=("markdown", "json", "html"),
+        default="markdown",
+        help="report format (default: markdown)",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="PATH",
+        help="write the report to this file instead of stdout",
     )
 
     return parser.parse_args(argv)

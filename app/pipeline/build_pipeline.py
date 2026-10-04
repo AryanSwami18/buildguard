@@ -9,6 +9,7 @@ from app.models.step import ActionType, BuildStep
 from app.models.validation import (
     AIComparisonMatch,
     AIComparisonResult,
+    DiscrepancyCategory,
     MatchStatus,
     StepMatch,
     ValidationResult,
@@ -654,12 +655,31 @@ class BuildPipeline:
                 )
 
             automation_steps = [bash_steps[bash_id] for bash_id in bash_ids]
+            category = _normalized_discrepancy_category(
+                item.status,
+                item.category,
+                wiki_steps.get(item.wiki_step_id) if item.wiki_step_id else None,
+                automation_steps,
+            )
+            recommendation = item.recommendation
+            if item.status in {
+                MatchStatus.MISSING,
+                MatchStatus.CONFLICT,
+                MatchStatus.EXTRA,
+            } and not (recommendation and recommendation.strip()):
+                recommendation = _default_recommendation(
+                    item.status,
+                    category,
+                    wiki_steps.get(item.wiki_step_id) if item.wiki_step_id else None,
+                )
             matches.append(
                 StepMatch(
                     wiki_step=(wiki_steps[item.wiki_step_id] if item.wiki_step_id else None),
                     automation_step=(automation_steps[0] if automation_steps else None),
                     automation_steps=automation_steps,
                     status=item.status,
+                    category=category,
+                    recommendation=recommendation,
                     explanation=item.explanation,
                 )
             )
@@ -887,6 +907,106 @@ def _comparison_step(step: BuildStep) -> dict[str, Any]:
             if key in context and context[key] not in (None, [])
         }
     return data
+
+
+def _normalized_discrepancy_category(
+    status: MatchStatus,
+    category: DiscrepancyCategory | None,
+    wiki_step: BuildStep | None,
+    bash_steps: list[BuildStep],
+) -> DiscrepancyCategory | None:
+    """Use fixed categories for missing/extra entries and validate AI categories."""
+    if status == MatchStatus.MISSING:
+        return DiscrepancyCategory.MISSING_STEP
+    if status == MatchStatus.EXTRA:
+        return DiscrepancyCategory.UNDOCUMENTED_STEP
+    if status != MatchStatus.CONFLICT:
+        return None
+
+    if category in {
+        DiscrepancyCategory.MISSING_STEP,
+        DiscrepancyCategory.UNDOCUMENTED_STEP,
+    }:
+        category = None
+    if category is not None:
+        return category
+    return _infer_conflict_category(wiki_step, bash_steps)
+
+
+def _infer_conflict_category(
+    wiki_step: BuildStep | None,
+    bash_steps: list[BuildStep],
+) -> DiscrepancyCategory:
+    """Classify an unlabelled conflict from explicit structured source values."""
+    if wiki_step is None:
+        return DiscrepancyCategory.OTHER_DEVIATION
+
+    if wiki_step.version and any(
+        step.version and step.version != wiki_step.version for step in bash_steps
+    ):
+        return DiscrepancyCategory.VERSION_INCONSISTENCY
+
+    wiki_packages = set(wiki_step.packages)
+    bash_packages = {package for step in bash_steps for package in step.packages}
+    if wiki_packages and bash_packages and wiki_packages != bash_packages:
+        return DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+
+    value_fields = (
+        "repository",
+        "ref",
+        "commit",
+        "urls",
+        "paths",
+        "docker_image",
+        "dockerfile",
+        "build_args",
+        "environment",
+        "patches",
+    )
+    for field_name in value_fields:
+        wiki_value = getattr(wiki_step, field_name)
+        if not wiki_value:
+            continue
+        bash_values = [
+            getattr(step, field_name)
+            for step in bash_steps
+            if getattr(step, field_name)
+        ]
+        if bash_values and all(value != wiki_value for value in bash_values):
+            return DiscrepancyCategory.PARAMETER_VALUE_MISMATCH
+
+    if wiki_step.action == ActionType.INSTALL_PACKAGE:
+        return DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+    if wiki_step.action == ActionType.CONFIGURE:
+        return DiscrepancyCategory.CONFIGURATION_MISMATCH
+    return DiscrepancyCategory.COMMAND_MISMATCH
+
+
+def _default_recommendation(
+    status: MatchStatus,
+    category: DiscrepancyCategory | None,
+    wiki_step: BuildStep | None,
+) -> str:
+    """Provide a safe fallback when a provider omits a correction suggestion."""
+    if status == MatchStatus.MISSING:
+        condition = " Preserve any documented platform or runtime conditions."
+        if wiki_step is not None and not wiki_step.context.conditions:
+            condition = ""
+        return (
+            "Implement the documented Wiki operation in the build script, using its "
+            "stated commands and values." + condition
+        )
+    if status == MatchStatus.EXTRA:
+        return (
+            "Confirm this operation is required for the build. If it is, document it "
+            "in the Build Instructions; otherwise remove or disable it only after "
+            "checking its effects."
+        )
+    category_name = category.value.replace("_", " ") if category else "reported"
+    return (
+        f"Resolve the {category_name} using the source evidence above. Update the "
+        "script to match the Wiki, or revise the Wiki if it is no longer authoritative."
+    )
 
 
 def _wiki_block_chunks(document: Any, max_chars: int) -> list[list[dict[str, Any]]]:

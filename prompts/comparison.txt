@@ -24,6 +24,19 @@ compatibility, and include that same ID in `bash_step_ids`.
   whose internal commands are being compared. The script does not implement its
   own bootstrap step; explain why it is outside this comparison.
 
+For every missing, conflict, or extra entry, also provide:
+- `category`: one of `missing_step`, `undocumented_step`,
+  `parameter_value_mismatch`, `version_inconsistency`,
+  `dependency_inconsistency`, `command_mismatch`,
+  `configuration_mismatch`, or `other_deviation`.
+- `recommendation`: one concise, actionable correction or review action grounded
+  in the supplied source values. Do not invent replacement versions or commands.
+  For an undocumented Bash step, recommend confirming whether it is required;
+  document it if required, or remove/disable it only if it is unnecessary.
+
+For matched and out_of_scope entries, use null for `category` and
+`recommendation`.
+
 For a missing step, use null for `bash_step_id` and an empty `bash_step_ids`
 array. Use the same empty Bash fields for an out_of_scope step. A parameterized Bash step may support multiple Wiki variants when its
 variables or conditions explicitly allow those values; it may be referenced by
