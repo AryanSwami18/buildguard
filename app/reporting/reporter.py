@@ -275,6 +275,8 @@ def _step_evidence(step: BuildStep) -> StepEvidence:
         description=step.description,
         action=step.action,
         location=_location(context, step.id),
+        line_start=context.line_start,
+        line_end=context.line_end,
         component=step.component,
         commands=step.commands,
         packages=step.packages,

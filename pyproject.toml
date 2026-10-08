@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 buildguard = "app.docs_cli:main"
 buildguard-docs = "app.docs_cli:main"
+buildguard-webhook = "app.webhook:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

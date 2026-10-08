@@ -27,6 +27,10 @@ from app.models.validation import (
 _VARIABLE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
 _WORD = re.compile(r"[a-z0-9][a-z0-9+_.-]{2,}")
 _VERSION = re.compile(r"(?<![a-z])(?:v)?\d+(?:\.\d+){1,3}(?![a-z])", re.I)
+_GITHUB_REPOSITORY = re.compile(
+    r"github\.com/[^/\s\"']+/([A-Za-z0-9_.-]+)",
+    re.I,
+)
 
 _IMPLEMENTATION_ACTIONS = {
     ActionType.SET_VARIABLE,
@@ -175,6 +179,13 @@ def _families(step: BuildStep) -> set[str]:
     if step.repository:
         repository = step.repository.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
         families.add(re.sub(r"[^a-z0-9]+", "-", repository.lower()).strip("-"))
+    # Wiki extraction may keep a GitHub clone URL in ``commands`` without
+    # populating the structured ``repository`` field. Recover the repository
+    # family from that URL so the action can be grouped with the corresponding
+    # Bash clone/build workflow.
+    for repository in _GITHUB_REPOSITORY.findall(" ".join(step.commands)):
+        repository = repository.removesuffix(".git")
+        families.add(re.sub(r"[^a-z0-9]+", "-", repository.lower()).strip("-"))
     return {family for family in families if family}
 
 
@@ -300,7 +311,12 @@ def _semantic_score(wiki: BuildStep, script: BuildStep) -> float:
     script_families = _families(script)
     family_overlap = wiki_families & script_families
     if family_overlap:
-        score += 0.45 if "java" in family_overlap else 0.35
+        # A shared component/repository family is stronger evidence than
+        # generic command-word similarity. This matters for Wiki actions that
+        # are represented as one RUN_COMMAND containing a complete workflow;
+        # otherwise an unrelated Maven command can outrank the matching clone
+        # merely because both descriptions contain common build words.
+        score += 0.45
     if _action_compatible(wiki, script):
         score += 0.12
     score += min(_value_overlap(wiki, script), 0.35)

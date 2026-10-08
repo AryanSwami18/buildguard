@@ -15,6 +15,7 @@ from app.sources.github import GitHubDirectoryEntry, GitHubFile, GitHubWikiPage
 
 GITHUB_REQUEST_TIMEOUT_SECONDS = 30
 WIKI_CLONE_TIMEOUT_SECONDS = 60
+WIKI_REVISION_TIMEOUT_SECONDS = 30
 
 
 class GitHubClient:
@@ -108,6 +109,41 @@ class GitHubClient:
                 key=str.casefold,
             )
 
+    def wiki_revision(self, ref: str | None = None) -> str:
+        """Return the current remote Wiki revision without cloning its files."""
+        if not self.repository:
+            raise ValueError("GITHUB_REPO is required to check Wiki revisions")
+
+        resolved_ref = self._resolve_ref(ref)
+        remote_ref = "HEAD" if resolved_ref == "HEAD" else f"refs/heads/{resolved_ref}"
+        command = [
+            "git",
+            "ls-remote",
+            f"https://github.com/{self.repository}.wiki.git",
+            remote_ref,
+        ]
+        environment = self._wiki_environment()
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=WIKI_REVISION_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(
+                f"Unable to check GitHub Wiki revision for '{self.repository}'"
+            ) from error
+
+        revision = result.stdout.strip().split(maxsplit=1)
+        if not revision or not revision[0]:
+            raise RuntimeError(
+                f"GitHub Wiki returned no revision for '{self.repository}'"
+            )
+        return revision[0]
+
     def _clone_wiki_repository(
         self,
         repository: str,
@@ -119,15 +155,7 @@ class GitHubClient:
             command.extend(["--branch", ref])
         command.extend([f"https://github.com/{repository}.wiki.git", str(checkout)])
 
-        environment = os.environ.copy()
-        if self.token:
-            environment.update(
-                {
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "http.extraHeader",
-                    "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {self.token}",
-                }
-            )
+        environment = self._wiki_environment()
         try:
             self._run_wiki_clone(command, environment)
         except (OSError, subprocess.CalledProcessError) as error:
@@ -147,6 +175,18 @@ class GitHubClient:
             raise RuntimeError(
                 f"Unable to retrieve GitHub Wiki '{repository}': {detail.strip()}"
             ) from error
+
+    def _wiki_environment(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        if self.token:
+            environment.update(
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "http.extraHeader",
+                    "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {self.token}",
+                }
+            )
+        return environment
 
     def list_path(
         self, repository: str, path: str = "", ref: str | None = None
@@ -255,6 +295,42 @@ class GitHubClient:
         ref: str | None = None,
     ) -> GitHubFile:
         """Find and fetch the build shell script for a product/version."""
+        selected = self._select_build_script(
+            repository,
+            product,
+            version,
+            ref,
+        )
+        resolved_ref = self._resolve_ref(ref)
+        return self.fetch_file(repository, selected.path, resolved_ref)
+
+    def find_build_script_reference(
+        self,
+        repository: str,
+        product: str,
+        version: str,
+        ref: str | None = None,
+    ) -> tuple[str, str | None]:
+        """Find a build script and return its path plus its GitHub blob SHA."""
+        resolved_ref = self._resolve_ref(ref)
+        selected = self._select_build_script(repository, product, version, ref)
+        metadata = self._get_json(
+            self._contents_url(repository, selected.path, resolved_ref)
+        )
+        remote_revision = (
+            metadata.get("sha")
+            if isinstance(metadata, dict) and isinstance(metadata.get("sha"), str)
+            else None
+        )
+        return selected.path, remote_revision
+
+    def _select_build_script(
+        self,
+        repository: str,
+        product: str,
+        version: str,
+        ref: str | None,
+    ) -> GitHubDirectoryEntry:
         resolved_ref = self._resolve_ref(ref)
         product_path = product.strip().strip("/")
         if not product_path:
@@ -287,5 +363,4 @@ class GitHubClient:
             raise ValueError(
                 f"Multiple shell scripts found in {repository}/{version_path}: {names}"
             )
-
-        return self.fetch_file(repository, selected.path, resolved_ref)
+        return selected

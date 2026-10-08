@@ -100,6 +100,30 @@ python -m app.main Alfresco --format html --output report.html
 Progress and errors go to stderr. The installed command is available as
 `buildguard`; `buildguard-docs` remains as a compatibility alias.
 
+## Parsed-source cache and GitHub synchronization
+
+BuildGuard stores validated Wiki and Bash `BuildInstruction` objects in a local
+SQLite database at `.buildguard/buildguard.sqlite3`. Set
+`BUILDGUARD_DATABASE_PATH` to use another location. On a comparison, it checks
+the current Wiki revision and script blob SHA first. If the source is unchanged,
+the stored parsed output is reused; if it changed or is not cached, the existing
+fetch/parse path runs and updates the cache. The comparison and report generation
+still run normally for every request.
+
+For proactive updates, configure a webhook secret and run the standalone listener:
+
+```bash
+export GITHUB_WEBHOOK_SECRET="choose-a-long-random-secret"
+buildguard-webhook
+```
+
+Expose `POST /github/webhook` to GitHub and use the same secret in the webhook
+configuration. Enable the **Push** event for the scripts repository and the
+**Wiki** event for the documentation repository. The listener recognizes changed
+`Building-*.md` pages and versioned `.sh` build scripts, then refreshes only the
+affected package's parsed cache in the background. `GET /healthz` is available
+for a service health check.
+
 ## Streamlit interface
 
 Install project dependencies, then launch the web interface from the project
@@ -122,5 +146,3 @@ pytest -q
 
 The tests cover AST structure, Markdown document context, generic LLM pipeline
 requests, Pydantic model validation, and contextual matching.
-
-Persistence and change detection are intentionally not implemented yet.

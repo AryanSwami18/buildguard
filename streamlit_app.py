@@ -10,8 +10,13 @@ from dotenv import load_dotenv
 
 from app.config.settings import Settings
 from app.models.report import ComparisonReport
+from app.reporting.code_view import annotations_by_line
 from app.reporting.reporter import render_report
-from app.service import list_available_packages, run_package_comparison
+from app.service import (
+    list_available_packages,
+    load_script_source_content,
+    run_package_comparison,
+)
 
 
 st.set_page_config(
@@ -169,6 +174,22 @@ def _inject_styles() -> None:
         [data-testid="stExpander"] { border-color: var(--line); border-radius: .8rem; background: var(--surface); }
         [data-testid="stAlert"] { border-radius: .75rem; background: var(--surface-raised); border-color: var(--line); color: var(--ink); }
         .bg-empty { color: var(--muted); font-size: .9rem; margin-top: 1rem; }
+        .bg-code-legend { display: flex; flex-wrap: wrap; gap: .55rem; margin: .7rem 0 1rem; }
+        .bg-code-legend-item { border: 1px solid var(--line); border-radius: .55rem; padding: .35rem .55rem; color: var(--muted); font-size: .78rem; }
+        .bg-code-legend-item::before { content: ""; display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; margin-right: .4rem; background: currentColor; }
+        .bg-code-legend-item.undocumented { color: #e3a52f; }
+        .bg-code-legend-item.conflict { color: #ff6b62; }
+        .bg-code-legend-item.unused { color: #c084fc; }
+        .bg-code-view { overflow: auto; border: 1px solid var(--line); border-radius: .8rem; background: #0a0d12; padding: .8rem 0; max-height: 72vh; }
+        .bg-code-row { display: flex; min-width: max-content; line-height: 1.55; font: .82rem/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        .bg-code-number { user-select: none; width: 4.2rem; flex: 0 0 4.2rem; padding-right: .9rem; text-align: right; color: #536071; }
+        .bg-code-text { padding-right: 1.5rem; white-space: pre; color: #d6deeb; }
+        .bg-code-comment { padding: .1rem 0 .1rem 0; background: #141a24; }
+        .bg-code-comment .bg-code-text { color: #a9b9d1; font-style: italic; }
+        .bg-code-line-undocumented { background: rgba(227, 165, 47, .16); border-left: 3px solid #e3a52f; }
+        .bg-code-line-conflict { background: rgba(248, 81, 73, .18); border-left: 3px solid #f85149; }
+        .bg-code-line-unused { background: rgba(192, 132, 252, .16); border-left: 3px solid #c084fc; }
+        .bg-code-line-other { background: rgba(110, 140, 255, .16); border-left: 3px solid var(--brand); }
         </style>
         """,
         unsafe_allow_html=True,
@@ -315,6 +336,67 @@ def _render_findings_overview(report: ComparisonReport) -> None:
             st.info(f"Recommended next step: {item.recommendation}")
 
 
+def _render_code_view(report: ComparisonReport) -> None:
+    """Render the full Bash source with display-only finding annotations."""
+    try:
+        script = load_script_source_content(report, settings)
+    except Exception as error:
+        st.error(f"The complete script could not be loaded: {error}")
+        return
+    if script is None:
+        st.info("No Bash script source is available for this comparison.")
+        return
+
+    lines = script.splitlines()
+    annotations = annotations_by_line(report, len(lines))
+    st.caption(
+        "This is the complete script. BuildGuard comments and colors are display-only; "
+        "the original script is not modified."
+    )
+    st.markdown(
+        '<div class="bg-code-legend">'
+        '<span class="bg-code-legend-item undocumented">Undocumented script action</span>'
+        '<span class="bg-code-legend-item conflict">Potential conflict</span>'
+        '<span class="bg-code-legend-item unused">Unused configuration</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    rows: list[str] = []
+    rendered_comments: set[tuple[int, str]] = set()
+    for line_number, line in enumerate(lines, start=1):
+        line_annotations = annotations.get(line_number, [])
+        for annotation in line_annotations:
+            comment_key = (annotation.comment_line, annotation.comment)
+            if annotation.comment_line != line_number or comment_key in rendered_comments:
+                continue
+            rendered_comments.add(comment_key)
+            rows.append(
+                '<div class="bg-code-row bg-code-comment">'
+                '<span class="bg-code-number"> </span>'
+                f'<span class="bg-code-text">{escape(annotation.comment)}</span>'
+                '</div>'
+            )
+
+        classes = " ".join(
+            f"bg-code-line-{annotation.css_class}"
+            for annotation in {
+                item.css_class: item for item in line_annotations
+            }.values()
+        )
+        rows.append(
+            f'<div class="bg-code-row {classes}">'
+            f'<span class="bg-code-number">{line_number}</span>'
+            f'<span class="bg-code-text">{escape(line) or " "}</span>'
+            '</div>'
+        )
+
+    st.markdown(
+        '<div class="bg-code-view">' + "".join(rows) + '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _streamlit_finding_label(status: str) -> str:
     return {
         "missing": "Wiki instruction not found in the script",
@@ -450,8 +532,8 @@ if saved_report:
                 use_container_width=True,
             )
 
-        overview_tab, report_tab, data_tab = st.tabs(
-            ("Overview", "Full report", "Structured data")
+        overview_tab, report_tab, data_tab, code_tab = st.tabs(
+            ("Overview", "Full report", "Structured data", "Code")
         )
         with overview_tab:
             _render_findings_overview(report)
@@ -459,6 +541,8 @@ if saved_report:
             st.markdown(render_report(report, "markdown"))
         with data_tab:
             st.json(report.model_dump(mode="json", exclude_none=True))
+        with code_tab:
+            _render_code_view(report)
 
 if not saved_report:
     st.caption("Enter a package and run a comparison to begin.")

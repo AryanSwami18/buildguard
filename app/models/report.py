@@ -37,6 +37,8 @@ class StepEvidence(BaseModel):
     description: str
     action: ActionType
     location: str
+    line_start: int | None = None
+    line_end: int | None = None
     component: str | None = None
     commands: list[str] = Field(default_factory=list)
     packages: list[str] = Field(default_factory=list)

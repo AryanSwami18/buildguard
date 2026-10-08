@@ -97,6 +97,52 @@ def test_grouped_java_workflow_is_not_reported_as_many_script_extras() -> None:
     assert len(result.matches[0].automation_steps) == len(script_steps)
 
 
+def test_wiki_github_clone_url_groups_with_script_repository_workflow() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.RUN_COMMAND,
+        "Clone Bazel source code and apply patch",
+        commands=[
+            "git clone --depth 1 -b 9.2.0 https://github.com/bazelbuild/bazel.git",
+            "curl -sSLO $PATCH_URL/bazel.patch",
+            "patch -p1 < bazel.patch",
+        ],
+    )
+    script_steps = parse_bash_steps(
+        "configureAndInstall() {\n"
+        "  git clone --depth 1 -b $PACKAGE_VERSION https://github.com/bazelbuild/bazel.git\n"
+        "  curl -sSLO $PATCH_URL/bazel.patch\n"
+        "  patch -p1 < bazel.patch\n"
+        "  rm -f bazel.patch\n"
+        "}\n",
+        "build_bazel.sh",
+    )
+    wiki = BuildInstruction(name="wiki", source="wiki", steps=[wiki_step])
+    bash = BuildInstruction(name="build.sh", source="bash", steps=script_steps)
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(wiki_step=wiki_step, status=MatchStatus.MISSING, explanation="missing"),
+                *[
+                    StepMatch(automation_step=step, status=MatchStatus.EXTRA, explanation="extra")
+                    for step in script_steps
+                ],
+            ],
+            valid=False,
+            summary="",
+        ),
+        wiki,
+        bash,
+    )
+
+    matched = next(match for match in result.matches if match.status == MatchStatus.MATCHED)
+    assert {step.id for step in matched.automation_steps} == {
+        step.id for step in script_steps
+        if step.action != ActionType.DELETE
+    }
+    assert any(match.status == MatchStatus.IMPLEMENTATION_DETAIL for match in result.matches)
+
+
 def test_unrelated_meaningful_script_action_remains_a_documentation_gap() -> None:
     wiki_step = _step("wiki-1", ActionType.INSTALL_PACKAGE, "Install Java", packages=["java"])
     extra = _step(

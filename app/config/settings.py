@@ -70,6 +70,25 @@ class Settings:
         )
     )
 
+    buildguard_database_path: str = field(
+        default_factory=lambda: os.getenv(
+            "BUILDGUARD_DATABASE_PATH",
+            ".buildguard/buildguard.sqlite3",
+        )
+    )
+
+    github_webhook_secret: str | None = field(
+        default_factory=lambda: os.getenv("GITHUB_WEBHOOK_SECRET")
+    )
+
+    webhook_host: str = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_WEBHOOK_HOST", "0.0.0.0")
+    )
+
+    webhook_port: int = field(
+        default_factory=lambda: int(os.getenv("BUILDGUARD_WEBHOOK_PORT", "8080"))
+    )
+
     gemini_api_key: str | None = field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY")
     )
