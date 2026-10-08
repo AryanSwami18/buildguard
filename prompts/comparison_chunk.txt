@@ -34,6 +34,11 @@ actionable `recommendation`. Categories are `missing_step`,
 supplied Wiki and Bash evidence. For matched entries, set both fields to null.
 
 Accuracy rules:
+- Treat a Wiki build action as a semantic unit. Group the Bash function's
+  downloads, variables, exports, Git operations, patches, Docker commands,
+  and cleanup under that action; do not make each shell statement an EXTRA.
+- A configuration assignment is not a build action by itself. Resolve its
+  `${VAR}` or `$VAR` use against the supplied Bash values.
 - Follow supplied Bash variables, defaults, conditions, and function context
   before deciding that an operation or value is absent.
 - Use any `runtime_options` and `runtime_defaults` in Bash context as source

@@ -71,6 +71,16 @@ def run_package_comparison(
     )
 
 
+def list_available_packages(settings: Settings) -> list[str]:
+    """List package names represented by BuildGuard Wiki modules."""
+    github = GitHubClient.from_settings(settings)
+    packages = {
+        product_from_module(module)
+        for module in github.list_wiki_modules()
+    }
+    return sorted(packages, key=str.casefold)
+
+
 def wiki_module_for_package(package: str) -> str:
     """Accept either a package name or its explicit Wiki module name."""
     value = package.strip()

@@ -77,46 +77,76 @@ class GitHubClient:
 
         with TemporaryDirectory(prefix="buildguard-wiki-") as directory:
             checkout = Path(directory) / "wiki"
-            command = ["git", "clone", "--depth", "1"]
-            if ref != "HEAD":
-                command.extend(["--branch", ref])
-            command.extend([f"https://github.com/{repository}.wiki.git", str(checkout)])
-
-            environment = os.environ.copy()
-            if self.token:
-                environment.update(
-                    {
-                        "GIT_CONFIG_COUNT": "1",
-                        "GIT_CONFIG_KEY_0": "http.extraHeader",
-                        "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {self.token}",
-                    }
-                )
-            try:
-                self._run_wiki_clone(command, environment)
-            except (OSError, subprocess.CalledProcessError) as error:
-                # A stale token should not prevent access to a public Wiki. Retry
-                # anonymously before reporting the clone failure.
-                if self.token and isinstance(error, subprocess.CalledProcessError):
-                    anonymous_environment = environment.copy()
-                    for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
-                        anonymous_environment.pop(key, None)
-                    try:
-                        self._run_wiki_clone(command, anonymous_environment)
-                    except (OSError, subprocess.CalledProcessError) as retry_error:
-                        error = retry_error
-                    else:
-                        error = None
-                if error is None:
-                    pass
-                else:
-                    detail = getattr(error, "stderr", "") or str(error)
-                    raise RuntimeError(f"Unable to retrieve GitHub Wiki '{repository}': {detail.strip()}") from error
+            self._clone_wiki_repository(repository, checkout, ref)
 
             wiki_path = checkout / relative_path
             try:
                 return wiki_path.read_text(encoding="utf-8")
             except FileNotFoundError as error:
                 raise ValueError(f"GitHub Wiki page was not found: {path}") from error
+
+    def list_wiki_modules(self) -> list[str]:
+        """Return the package build pages available in the configured Wiki."""
+        if not self.repository:
+            raise ValueError("GITHUB_REPO is required to list Wiki modules")
+
+        with TemporaryDirectory(prefix="buildguard-wiki-list-") as directory:
+            checkout = Path(directory) / "wiki"
+            self._clone_wiki_repository(
+                self.repository,
+                checkout,
+                self._resolve_ref(None),
+            )
+            return sorted(
+                (
+                    path.stem
+                    for path in checkout.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() == ".md"
+                    and path.stem.casefold().startswith("building-")
+                ),
+                key=str.casefold,
+            )
+
+    def _clone_wiki_repository(
+        self,
+        repository: str,
+        checkout: Path,
+        ref: str,
+    ) -> None:
+        command = ["git", "clone", "--depth", "1"]
+        if ref != "HEAD":
+            command.extend(["--branch", ref])
+        command.extend([f"https://github.com/{repository}.wiki.git", str(checkout)])
+
+        environment = os.environ.copy()
+        if self.token:
+            environment.update(
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "http.extraHeader",
+                    "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {self.token}",
+                }
+            )
+        try:
+            self._run_wiki_clone(command, environment)
+        except (OSError, subprocess.CalledProcessError) as error:
+            # A stale token should not prevent access to a public Wiki. Retry
+            # anonymously before reporting the clone failure.
+            if self.token and isinstance(error, subprocess.CalledProcessError):
+                anonymous_environment = environment.copy()
+                for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
+                    anonymous_environment.pop(key, None)
+                try:
+                    self._run_wiki_clone(command, anonymous_environment)
+                except (OSError, subprocess.CalledProcessError) as retry_error:
+                    error = retry_error
+                else:
+                    return
+            detail = getattr(error, "stderr", "") or str(error)
+            raise RuntimeError(
+                f"Unable to retrieve GitHub Wiki '{repository}': {detail.strip()}"
+            ) from error
 
     def list_path(
         self, repository: str, path: str = "", ref: str | None = None

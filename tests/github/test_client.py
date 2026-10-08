@@ -1,5 +1,6 @@
 import base64
 import json
+from pathlib import Path
 
 from app.github.client import GitHubClient
 from app.config.settings import Settings
@@ -135,3 +136,17 @@ def test_default_wiki_ref_uses_the_wiki_default_branch(monkeypatch) -> None:
 
     assert page.ref == "HEAD"
     assert page.path == "Module.md"
+
+
+def test_client_lists_building_wiki_modules(monkeypatch) -> None:
+    def fake_clone(self, repository: str, checkout: Path, ref: str):
+        checkout.mkdir(parents=True)
+        (checkout / "Building-Alfresco.md").write_text("# Alfresco", encoding="utf-8")
+        (checkout / "Building-Share.md").write_text("# Share", encoding="utf-8")
+        (checkout / "Home.md").write_text("# Home", encoding="utf-8")
+
+    monkeypatch.setattr(GitHubClient, "_clone_wiki_repository", fake_clone)
+
+    client = GitHubClient(repository="example/docs")
+
+    assert client.list_wiki_modules() == ["Building-Alfresco", "Building-Share"]

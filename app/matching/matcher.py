@@ -1,4 +1,5 @@
 from app.matching.context_matcher import similarity
+from app.matching.semantic_matcher import normalize_validation_result
 from app.models.build import BuildInstruction
 from app.models.validation import MatchStatus, StepMatch, ValidationResult
 
@@ -35,8 +36,12 @@ class BuildMatcher:
             status=MatchStatus.EXTRA,
             explanation="This automation step has no corresponding Wiki step.",
         ) for step in unmatched)
-        valid = all(match.status == MatchStatus.MATCHED for match in matches)
-        return ValidationResult(matches=matches, valid=valid, summary=self._summary(matches))
+        result = ValidationResult(
+            matches=matches,
+            valid=all(match.status == MatchStatus.MATCHED for match in matches),
+            summary=self._summary(matches),
+        )
+        return normalize_validation_result(result, wiki, automation)
 
     @staticmethod
     def _best_candidate(wiki_step, candidates, matched_ids):

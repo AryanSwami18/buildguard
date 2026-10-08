@@ -14,6 +14,7 @@ from app.models.validation import (
     StepMatch,
     ValidationResult,
 )
+from app.matching.semantic_matcher import normalize_validation_result
 from app.parsers.bash_normalizer import normalize_bash
 from app.parsers.bash_parser import parse_script
 from app.parsers.semantic_parser import parse_semantic_facts
@@ -126,11 +127,15 @@ def _comparison_batch_result(content: str, batch_index: int) -> AIComparisonResu
     match_payloads = response.get("matches")
     if isinstance(match_payloads, list):
         for match_payload in match_payloads:
-            if (
-                isinstance(match_payload, dict)
-                and match_payload.get("bash_step_id") == ""
-            ):
+            if not isinstance(match_payload, dict):
+                continue
+            if match_payload.get("bash_step_id") == "":
                 match_payload["bash_step_id"] = None
+            if not match_payload.get("explanation"):
+                match_payload["explanation"] = (
+                    "The comparison provider returned no explanation; "
+                    "classification was completed from the supplied source fields."
+                )
     response.setdefault("summary", "")
     try:
         return AIComparisonResult.model_validate(response)
@@ -360,7 +365,11 @@ class BuildPipeline:
         )
         response_data = _provider_json(self.llm.generate(request).content, "comparison")
         ai_result = AIComparisonResult.model_validate(response_data)
-        return self._validate_comparison(ai_result, wiki, bash)
+        return normalize_validation_result(
+            self._validate_comparison(ai_result, wiki, bash),
+            wiki,
+            bash,
+        )
 
     def _compare_in_chunks(
         self,
@@ -572,8 +581,12 @@ class BuildPipeline:
             f"{status_counts[MatchStatus.EXTRA]} extra; "
             f"{status_counts[MatchStatus.OUT_OF_SCOPE]} bootstrap steps outside scope."
         )
-        return self._validate_comparison(
-            AIComparisonResult(summary=summary, matches=all_matches),
+        return normalize_validation_result(
+            self._validate_comparison(
+                AIComparisonResult(summary=summary, matches=all_matches),
+                wiki,
+                bash,
+            ),
             wiki,
             bash,
         )

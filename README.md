@@ -110,7 +110,7 @@ pip install -e .
 streamlit run streamlit_app.py
 ```
 
-Enter one package or Wiki module, run the comparison, and review the
+Select a package from the configured Wiki, run the comparison, and review the
 mismatch-only report in the browser. The download control exports the same
 report as Markdown, JSON, or standalone HTML.
 

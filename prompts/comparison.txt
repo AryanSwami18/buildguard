@@ -45,6 +45,13 @@ step not referenced by any Wiki entry, return one extra entry. Preserve all IDs
 exactly as supplied.
 
 Accuracy rules:
+- Treat a Wiki build action as a semantic unit. A Bash function workflow may
+  implement it with downloads, extraction, variables, exports, Git fetch/
+  checkout, patches, Docker builds, and cleanup; include those contributing
+  IDs under the one Wiki action rather than returning them as individual extras.
+- A configuration assignment is evidence for the operation that consumes it,
+  not a standalone build step. Resolve `${VAR}` and `$VAR` from the supplied
+  source before comparing versions or commits.
 - Follow Bash variables, explicit defaults, conditions, and function context
   before deciding that an operation or value is absent.
 - Use any `runtime_options` and `runtime_defaults` in Bash context as source

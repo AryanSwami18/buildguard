@@ -46,7 +46,7 @@ _GIT_CHECKOUT = re.compile(
 )
 
 _DOCKER_TAG = re.compile(
-    r"\b(?:-t|--tag)\s+(?P<image>[^\s;&|]+)"
+    r"(?:-t|--tag)\s+(?P<image>[^\s;&|]+)"
 )
 
 _BUILD_ARG = re.compile(
@@ -63,6 +63,18 @@ _JAVA_RUNTIME_OPTION = re.compile(r"\b(?:IBMSemeru|Temurin|OpenJDK)\d+\b")
 _JAVA_PROVIDED_ASSIGNMENT = re.compile(
     r"(?m)^\s*(?:export\s+)?JAVA_PROVIDED\s*=\s*(?P<value>[^\r\n]+)"
 )
+_VARIABLE_REFERENCE = re.compile(
+    r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+_ENVIRONMENT_EFFECT_NAMES = {
+    "PATH",
+    "JAVA_HOME",
+    "JAVA_PROVIDED",
+    "SOURCE_ROOT",
+    "ALLOWERASING",
+}
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,7 @@ class BashSemanticParser:
         #
         #   git checkout "$JAVA_BASE_COMMIT"
         facts = parse_semantic_facts(script)
+        unused_configuration = self._unused_configuration_names(script, facts)
 
         steps: list[BuildStep] = []
 
@@ -143,6 +156,10 @@ class BashSemanticParser:
                     node.position_end,
                 ),
                 surrounding_text=node.text,
+                context_labels=self._context_labels(
+                    node.text,
+                    unused_configuration,
+                ),
                 previous_step_id=previous_id,
                 next_step_id=next_id,
             )
@@ -366,6 +383,9 @@ class BashSemanticParser:
 
         environment = self._assignments(
             words
+        )
+        environment.update(
+            self._referenced_configurations(command, facts)
         )
 
         build_args = self._build_args(command)
@@ -663,6 +683,55 @@ class BashSemanticParser:
             }
             or name.endswith(("_VERSION", "_COMMIT", "_URL", "_REF", "_BRANCH"))
         )
+
+    @staticmethod
+    def _context_labels(
+        command: str,
+        unused_configuration: set[str],
+    ) -> list[str]:
+        """Label configuration declarations without treating them as actions."""
+        match = _ASSIGNMENT.match(command.strip())
+        if not match:
+            return []
+
+        labels = ["configuration"]
+        if match.group("name") in unused_configuration:
+            labels.append("unused_configuration")
+        return labels
+
+    @staticmethod
+    def _referenced_configurations(command: str, facts) -> dict[str, str]:
+        """Attach resolved values to the operation that actually consumes them."""
+        values: dict[str, str] = {}
+        for match in _VARIABLE_REFERENCE.finditer(command):
+            name = match.group("braced") or match.group("plain")
+            if name in facts.variables:
+                values[name] = facts.variables[name]
+        return values
+
+    @staticmethod
+    def _unused_configuration_names(script: str, facts) -> set[str]:
+        """Find source-defined configuration never read by the script.
+
+        A declaration itself is excluded from the reference scan. Environment
+        assignments are treated as used because their effect is observable by
+        child processes even without a literal ``$NAME`` expansion.
+        """
+        used: set[str] = set(_ENVIRONMENT_EFFECT_NAMES)
+        for match in _VARIABLE_REFERENCE.finditer(script):
+            used.add(match.group("braced") or match.group("plain"))
+
+        return {
+            name
+            for name in facts.variables
+            if name not in used
+            and (
+                name.upper().endswith(
+                    ("_VERSION", "_COMMIT", "_URL", "_REF", "_BRANCH")
+                )
+                or name.upper() in {"JAVA_PROVIDED", "MAVEN_VERSION"}
+            )
+        }
 
     @staticmethod
     def _packages_from_command(

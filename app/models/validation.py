@@ -11,6 +11,8 @@ class MatchStatus(str, Enum):
     EXTRA = "extra"
     CONFLICT = "conflict"
     OUT_OF_SCOPE = "out_of_scope"
+    IMPLEMENTATION_DETAIL = "implementation_detail"
+    UNUSED_CONFIGURATION = "unused_configuration"
 
 
 class DiscrepancyCategory(str, Enum):
@@ -23,6 +25,7 @@ class DiscrepancyCategory(str, Enum):
     DEPENDENCY_INCONSISTENCY = "dependency_inconsistency"
     COMMAND_MISMATCH = "command_mismatch"
     CONFIGURATION_MISMATCH = "configuration_mismatch"
+    UNUSED_CONFIGURATION = "unused_configuration"
     OTHER_DEVIATION = "other_deviation"
 
 

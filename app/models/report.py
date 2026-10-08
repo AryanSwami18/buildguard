@@ -17,12 +17,19 @@ class ReportSource(BaseModel):
 class ComparisonCounts(BaseModel):
     wiki_steps_compared: int
     script_steps_checked: int
+    wiki_build_actions_analyzed: int = 0
+    script_build_actions_analyzed: int = 0
     missing_steps: int
     conflicting_steps: int
     undocumented_script_steps: int
     out_of_scope_steps: int
     findings: int
     by_category: dict[str, int] = Field(default_factory=dict)
+    semantic_matches: int = 0
+    true_documentation_gaps: int = 0
+    potential_conflicts: int = 0
+    unused_configuration: int = 0
+    implementation_details_ignored: int = 0
 
 
 class StepEvidence(BaseModel):
