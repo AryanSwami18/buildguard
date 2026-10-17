@@ -585,7 +585,7 @@ def _render_result_banner(report: ComparisonReport) -> None:
 def _render_comparison_progress(job_id: str) -> None:
     """Poll a backend comparison and show its overall progress."""
     try:
-        status, _progress, progress_percent, report, error = api_client.get_comparison(job_id)
+        status, _progress, progress_percent, progress_log, report, error = api_client.get_comparison(job_id)
     except Exception as error:  # Display backend failures without a traceback.
         st.error(f"Could not read comparison progress: {error}")
         return
@@ -596,6 +596,8 @@ def _render_comparison_progress(job_id: str) -> None:
             progress_percent / 100,
             text=f"Estimated overall progress: {progress_percent}%",
         )
+        with st.expander("Live terminal", expanded=False):
+            st.code("\n".join(progress_log), language="text")
         st.caption(
             "Progress updates automatically while BuildGuard checks the cache, "
             "parses sources, and compares the build actions."

@@ -135,6 +135,30 @@ class GitHubClient:
                 timeout=WIKI_REVISION_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            # A public Wiki can still be readable when a configured token is
+            # stale, scoped for the API only, or rejected by Git. Mirror the
+            # clone fallback so cache verification does not fail merely
+            # because authenticated Git access failed.
+            if self.token and isinstance(error, subprocess.CalledProcessError):
+                anonymous_environment = self._anonymous_wiki_environment(environment)
+                try:
+                    result = subprocess.run(
+                        command,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        env=anonymous_environment,
+                        timeout=WIKI_REVISION_TIMEOUT_SECONDS,
+                    )
+                except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as retry_error:
+                    error = retry_error
+                else:
+                    revision = result.stdout.strip().split(maxsplit=1)
+                    if not revision or not revision[0]:
+                        raise RuntimeError(
+                            f"GitHub Wiki returned no revision for '{self.repository}'"
+                        )
+                    return revision[0]
             raise RuntimeError(
                 f"Unable to check GitHub Wiki revision for '{self.repository}'"
             ) from error
@@ -164,9 +188,7 @@ class GitHubClient:
             # A stale token should not prevent access to a public Wiki. Retry
             # anonymously before reporting the clone failure.
             if self.token and isinstance(error, subprocess.CalledProcessError):
-                anonymous_environment = environment.copy()
-                for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
-                    anonymous_environment.pop(key, None)
+                anonymous_environment = self._anonymous_wiki_environment(environment)
                 try:
                     self._run_wiki_clone(command, anonymous_environment)
                 except (OSError, subprocess.CalledProcessError) as retry_error:
@@ -177,6 +199,14 @@ class GitHubClient:
             raise RuntimeError(
                 f"Unable to retrieve GitHub Wiki '{repository}': {detail.strip()}"
             ) from error
+
+    @staticmethod
+    def _anonymous_wiki_environment(environment: dict[str, str]) -> dict[str, str]:
+        """Remove the Git auth override while preserving the process env."""
+        anonymous_environment = environment.copy()
+        for key in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
+            anonymous_environment.pop(key, None)
+        return anonymous_environment
 
     def _wiki_environment(self) -> dict[str, str]:
         environment = os.environ.copy()

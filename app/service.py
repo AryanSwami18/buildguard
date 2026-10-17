@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
 import re
 from threading import Lock
 from typing import Any
@@ -49,6 +50,9 @@ class _ComparisonJob:
     future: Future[ComparisonReport] | None = None
     progress: str = "Queued for comparison..."
     progress_percent: int = 0
+    progress_history: list[str] = field(
+        default_factory=lambda: ["Queued for comparison..."]
+    )
 
 
 _COMPARISON_EXECUTOR = ThreadPoolExecutor(
@@ -210,6 +214,9 @@ def start_package_comparison(package: str, settings: Settings) -> str:
                 job.progress_percent,
                 _comparison_progress_percent(message),
             )
+            if not job.progress_history or job.progress_history[-1] != message:
+                job.progress_history.append(message)
+                del job.progress_history[:-200]
 
     job.future = _COMPARISON_EXECUTOR.submit(
         run_package_comparison,
@@ -222,26 +229,39 @@ def start_package_comparison(package: str, settings: Settings) -> str:
 
 def get_package_comparison(
     job_id: str,
-) -> tuple[str, str, int, ComparisonReport | None, str | None]:
+) -> tuple[str, str, int, list[str], ComparisonReport | None, str | None]:
     """Return comparison status, progress, result, and error."""
     with _COMPARISON_JOBS_LOCK:
         job = _COMPARISON_JOBS.get(job_id)
         if job is None:
-            return "missing", "Comparison job is no longer available.", 0, None, (
-                "The comparison job is no longer available."
+            return (
+                "missing",
+                "Comparison job is no longer available.",
+                0,
+                [],
+                None,
+                "The comparison job is no longer available.",
             )
         future = job.future
         progress = job.progress
         progress_percent = job.progress_percent
+        progress_history = list(job.progress_history)
 
     if future is None or not future.done():
-        return "running", progress, progress_percent, None, None
+        return "running", progress, progress_percent, progress_history, None, None
 
     try:
         report = future.result()
     except Exception as error:  # Provider and source failures are shown in the UI.
-        return "failed", progress, progress_percent, None, str(error) or error.__class__.__name__
-    return "complete", "Comparison complete.", 100, report, None
+        return (
+            "failed",
+            progress,
+            progress_percent,
+            progress_history,
+            None,
+            str(error) or error.__class__.__name__,
+        )
+    return "complete", "Comparison complete.", 100, progress_history, report, None
 
 
 def _comparison_progress_percent(message: str) -> int:
@@ -483,6 +503,7 @@ def _load_wiki_instruction(
     path = module if module.lower().endswith(".md") else f"{module}.md"
     parser_version = _wiki_parser_version(settings)
     remote_revision: str | None = None
+    cached: tuple[BuildInstruction, str | None] | None = None
     if not force_refresh:
         try:
             remote_revision = github.wiki_revision(settings.github_branch)
@@ -508,6 +529,32 @@ def _load_wiki_instruction(
     notify(f"Fetching Wiki module '{module}'...")
     page = github.fetch_module_wiki(module)
     product = product_from_module(module)
+    if (
+        cached is not None
+        and cached[0].version is not None
+        and remote_revision is None
+        and cache.get_content_sha256(
+            source_kind="wiki",
+            repository=settings.github_repo,
+            path=page.path,
+            ref=settings.github_branch,
+            parser_version=parser_version,
+        )
+        == _content_sha256(page.content)
+    ):
+        notify(
+            "Wiki content is unchanged; using the cached parsed Wiki instructions."
+        )
+        cache.save_source_content(
+            source_kind="wiki",
+            repository=settings.github_repo,
+            path=page.path,
+            ref=settings.github_branch,
+            parser_version=parser_version,
+            content=page.content,
+        )
+        return cached[0]
+
     version = extract_version(page.content, product)
     if version is None:
         raise ValueError(
@@ -521,18 +568,23 @@ def _load_wiki_instruction(
             remote_revision = github.wiki_revision(settings.github_branch)
         except RuntimeError:
             remote_revision = None
-    if remote_revision is not None:
+    cache_revision = remote_revision or _content_sha256(page.content)
+    if cache_revision is not None:
         cache.save_instruction(
             source_kind="wiki",
             repository=settings.github_repo,
             path=page.path,
             ref=settings.github_branch,
             parser_version=parser_version,
-            remote_revision=remote_revision,
+            remote_revision=cache_revision,
             content=page.content,
             instruction=instruction,
         )
     return instruction
+
+
+def _content_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _load_bash_instruction(

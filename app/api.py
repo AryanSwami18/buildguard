@@ -150,11 +150,12 @@ def create_comparison_job(
 @app.get("/api/compare-jobs/{job_id}")
 def comparison_job(job_id: str, request: Request) -> dict[str, Any]:
     _require_internal_api(request)
-    status, progress, progress_percent, report, error = get_package_comparison(job_id)
+    status, progress, progress_percent, progress_log, report, error = get_package_comparison(job_id)
     response: dict[str, Any] = {
         "status": status,
         "progress": progress,
         "progress_percent": progress_percent,
+        "progress_log": progress_log,
         "error": error,
     }
     if report is not None:

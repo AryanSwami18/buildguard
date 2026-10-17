@@ -12,6 +12,7 @@ from app.service import (
     _load_wiki_instruction,
     _wiki_parser_version,
 )
+from app.sources.github import GitHubWikiPage
 from app.storage.repository import ParsedSourceRepository
 from app.webhook import _cache_jobs, verify_signature
 
@@ -46,6 +47,21 @@ class _CachedScriptClient:
 
     def fetch_file(self, **kwargs):
         raise AssertionError("cached Bash output should avoid fetching the script")
+
+
+class _UnavailableRevisionWikiClient:
+    def wiki_revision(self, ref: str) -> str:
+        raise RuntimeError("revision service unavailable")
+
+    def fetch_module_wiki(self, module: str) -> GitHubWikiPage:
+        return GitHubWikiPage(
+            repository="example/docs",
+            ref="HEAD",
+            path="Building-Alfresco.md",
+            filename="Building-Alfresco.md",
+            github_url="https://example.test/wiki/Building-Alfresco",
+            content="# cached",
+        )
 
 
 def test_cached_source_is_reused_when_remote_revision_matches(tmp_path) -> None:
@@ -108,6 +124,42 @@ def test_cached_source_is_reused_when_remote_revision_matches(tmp_path) -> None:
         ref="master",
         parser_version=BASH_PARSER_VERSION,
     ) == "echo cached"
+
+
+def test_cached_wiki_is_reused_when_revision_check_fails_but_content_is_unchanged(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        github_repo="example/docs",
+        buildguard_database_path=str(tmp_path / "buildguard.sqlite3"),
+    )
+    cache = ParsedSourceRepository(settings.buildguard_database_path)
+    wiki = _instruction("wiki", "Building-Alfresco.md", "25.3.0")
+    cache.save_instruction(
+        source_kind="wiki",
+        repository="example/docs",
+        path="Building-Alfresco.md",
+        ref="HEAD",
+        parser_version=_wiki_parser_version(settings),
+        remote_revision="old-wiki-sha",
+        content="# cached",
+        instruction=wiki,
+    )
+
+    class NoParsePipeline:
+        def from_github_wiki(self, *args, **kwargs):
+            raise AssertionError("unchanged Wiki content should avoid AI parsing")
+
+    result = _load_wiki_instruction(
+        github=_UnavailableRevisionWikiClient(),
+        pipeline=NoParsePipeline(),
+        cache=cache,
+        settings=settings,
+        module="Building-Alfresco",
+        notify=lambda message: None,
+    )
+
+    assert result.model_dump() == wiki.model_dump()
 
 
 def test_webhook_jobs_cover_wiki_changes_and_new_script_files() -> None:

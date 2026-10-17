@@ -1,6 +1,7 @@
 import base64
 import json
 from pathlib import Path
+import subprocess
 
 from app.github.client import GitHubClient
 from app.config.settings import Settings
@@ -137,6 +138,29 @@ def test_default_wiki_ref_uses_the_wiki_default_branch(monkeypatch) -> None:
 
     assert page.ref == "HEAD"
     assert page.path == "Module.md"
+
+
+def test_wiki_revision_retries_without_auth_when_authenticated_git_fails(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(
+                128,
+                args[0],
+                stderr="authentication failed",
+            )
+        return type("Result", (), {"stdout": "wiki-sha\tHEAD\n"})()
+
+    monkeypatch.setattr("app.github.client.subprocess.run", fake_run)
+
+    revision = GitHubClient(token="stale-token", repository="example/docs").wiki_revision()
+
+    assert revision == "wiki-sha"
+    assert len(calls) == 2
+    assert "GIT_CONFIG_VALUE_0" in calls[0]["env"]
+    assert "GIT_CONFIG_VALUE_0" not in calls[1]["env"]
 
 
 def test_client_lists_building_wiki_modules(monkeypatch) -> None:

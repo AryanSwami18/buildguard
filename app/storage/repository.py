@@ -228,6 +228,31 @@ class ParsedSourceRepository:
             ).fetchone()
         return None if row is None else row[0]
 
+    def get_content_sha256(
+        self,
+        *,
+        source_kind: str,
+        repository: str,
+        path: str,
+        ref: str,
+        parser_version: str,
+    ) -> str | None:
+        """Return the content fingerprint stored with a parsed source."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT content_sha256
+                FROM parsed_sources
+                WHERE source_kind = ?
+                  AND repository = ?
+                  AND path = ?
+                  AND ref = ?
+                  AND parser_version = ?
+                """,
+                (source_kind, repository, path, ref, parser_version),
+            ).fetchone()
+        return None if row is None else row[0]
+
     def get_comparison_report(
         self,
         key: ComparisonCacheKey,

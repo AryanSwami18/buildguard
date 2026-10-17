@@ -63,7 +63,7 @@ class BuildGuardAPIClient:
     def get_comparison(
         self,
         job_id: str,
-    ) -> tuple[str, str | None, int, ComparisonReport | None, str | None]:
+    ) -> tuple[str, str | None, int, list[str], ComparisonReport | None, str | None]:
         payload = self._request("GET", f"/api/compare-jobs/{job_id}")
         status = payload.get("status")
         if not isinstance(status, str):
@@ -74,15 +74,27 @@ class BuildGuardAPIClient:
         progress_percent = payload.get("progress_percent", 0)
         if not isinstance(progress_percent, int) or not 0 <= progress_percent <= 100:
             raise BuildGuardAPIError("BuildGuard API returned invalid comparison percentage")
+        progress_log = payload.get("progress_log", [])
+        if not isinstance(progress_log, list) or not all(
+            isinstance(message, str) for message in progress_log
+        ):
+            raise BuildGuardAPIError("BuildGuard API returned invalid comparison log")
         error = payload.get("error")
         if error is not None and not isinstance(error, str):
             error = str(error)
         if status != "complete":
-            return status, progress, progress_percent, None, error
+            return status, progress, progress_percent, progress_log, None, error
         report_data = payload.get("report")
         if not isinstance(report_data, dict):
             raise BuildGuardAPIError("BuildGuard API returned no comparison report")
-        return status, progress, progress_percent, ComparisonReport.model_validate(report_data), error
+        return (
+            status,
+            progress,
+            progress_percent,
+            progress_log,
+            ComparisonReport.model_validate(report_data),
+            error,
+        )
 
     def script_source(self, report: ComparisonReport) -> str | None:
         payload = self._request(
