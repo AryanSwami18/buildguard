@@ -107,36 +107,61 @@ SQLite database at `.buildguard/buildguard.sqlite3`. Set
 `BUILDGUARD_DATABASE_PATH` to use another location. On a comparison, it checks
 the current Wiki revision and script blob SHA first. If the source is unchanged,
 the stored parsed output is reused; if it changed or is not cached, the existing
-fetch/parse path runs and updates the cache. The comparison and report generation
-still run normally for every request.
+fetch/parse path runs and updates the cache. Reports are also stored using both
+source revisions, parser versions, and the AI model as the cache key. An unchanged
+package reuses its saved report without another AI comparison. The Streamlit UI
+lists saved reports by package so they can be reopened later.
 
-For proactive updates, configure a webhook secret and run the standalone listener:
+For proactive updates, configure a webhook secret. The recommended launcher
+starts both the FastAPI backend and Streamlit UI together:
 
 ```bash
-export GITHUB_WEBHOOK_SECRET="choose-a-long-random-secret"
-buildguard-webhook
+./run_buildguard.sh
 ```
 
-Expose `POST /github/webhook` to GitHub and use the same secret in the webhook
-configuration. Enable the **Push** event for the scripts repository and the
-**Wiki** event for the documentation repository. The listener recognizes changed
-`Building-*.md` pages and versioned `.sh` build scripts, then refreshes only the
-affected package's parsed cache in the background. `GET /healthz` is available
-for a service health check.
+The API listens on `127.0.0.1:8080` and the UI on `127.0.0.1:8501`. Expose
+`POST /github/webhook` on port `8080` to GitHub and use the same
+`GITHUB_WEBHOOK_SECRET` in the webhook configuration. Enable the **Push** event
+for the scripts repository and the **Wiki** event for the documentation
+repository. The backend recognizes changed `Building-*.md` pages and versioned
+`.sh` build scripts, then refreshes only the affected package's parsed cache in
+the background. `GET /healthz` is available for a service health check.
+
+The Streamlit UI communicates with the backend through `BUILDGUARD_API_URL`.
+The API uses `GITHUB_WEBHOOK_SECRET` as an internal API key when it is set, so
+the comparison and pull-request endpoints are not openly usable through the
+webhook tunnel. Override `BUILDGUARD_API_SECRET` if a separate internal key is
+preferred. The old `buildguard-webhook` command remains available for running
+only the standalone listener.
 
 ## Streamlit interface
 
-Install project dependencies, then launch the web interface from the project
-root:
+Install project dependencies, then launch both services from the project root:
 
 ```bash
 pip install -e .
-streamlit run streamlit_app.py
+./run_buildguard.sh
 ```
 
+The UI is available at `http://127.0.0.1:8501`.
+
 Select a package from the configured Wiki, run the comparison, and review the
-mismatch-only report in the browser. The download control exports the same
-report as Markdown, JSON, or standalone HTML.
+mismatch-only report in the browser. The report also has a Code view that shows
+the complete Bash script with display-only annotations for actionable findings.
+The download control exports the same report as Markdown, JSON, or standalone
+HTML.
+
+When a report contains findings, the UI can generate a complete-script fix
+proposal and show its diff. After reviewing the diff, use **Create draft PR** to
+commit the change and open a pull request against `SCRIPTS_REPO`. Set
+`GITHUB_TOKEN` with permission to create branches and pull requests. By default
+the branch is created in `SCRIPTS_REPO`; set `BUILDGUARD_PR_HEAD_REPO` to a
+fork such as `your-user/scripts` when the token cannot push to the base repo.
+`BUILDGUARD_PR_DRAFT=true` keeps generated pull requests in draft state. The
+current script is re-read before the commit, and PR creation is refused if it
+changed since the comparison.
+For a fine-grained GitHub token, grant **Contents: Read and write** and
+**Pull requests: Read and write** on the relevant base repository and fork.
 
 ## Tests
 

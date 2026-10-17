@@ -1,9 +1,11 @@
 """Small GitHub contents client used to retrieve build documentation and files."""
 
 import base64
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -216,23 +218,140 @@ class GitHubClient:
             filename=payload.get("name", PurePosixPath(path).name),
             github_url=payload.get("html_url") or self._file_url(repository, resolved_ref, path),
             content=base64.b64decode(content).decode("utf-8"),
+            sha=payload.get("sha") if isinstance(payload.get("sha"), str) else None,
         )
 
+    def create_file_pull_request(
+        self,
+        *,
+        repository: str,
+        head_repository: str | None,
+        base_branch: str,
+        path: str,
+        original_content: str,
+        fixed_content: str,
+        title: str,
+        body: str,
+        draft: bool = True,
+    ) -> dict[str, Any]:
+        """Create a branch, commit one file, and open a pull request.
+
+        The current base file is re-read and compared with ``original_content``
+        before any branch or commit is created. This prevents a stale report from
+        overwriting a newer script revision.
+        """
+        if not self.token:
+            raise ValueError("GITHUB_TOKEN is required to create a pull request")
+        if base_branch == "HEAD":
+            raise ValueError(
+                "SCRIPTS_BRANCH must be a concrete branch name when creating a PR"
+            )
+        if fixed_content == original_content:
+            raise ValueError("The proposed script has no changes")
+
+        head_repository = head_repository or repository
+        base_file = self.fetch_file(repository, path, base_branch)
+        if base_file.content != original_content:
+            raise RuntimeError(
+                "The build script changed on GitHub after this report was generated. "
+                "Run the comparison again before creating a PR."
+            )
+        if not base_file.sha:
+            raise RuntimeError("GitHub did not return the current file SHA")
+
+        base_ref = self._get_json(
+            self._git_ref_url(repository, base_branch)
+        )
+        try:
+            base_sha = base_ref["object"]["sha"]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError("GitHub did not return the base branch commit SHA") from error
+
+        branch = self._fix_branch_name(path)
+        self._request_json(
+            "POST",
+            self._git_refs_url(head_repository),
+            {
+                "ref": f"refs/heads/{branch}",
+                "sha": base_sha,
+            },
+        )
+        self._request_json(
+            "PUT",
+            self._contents_url(head_repository, path, branch),
+            {
+                "message": title,
+                "content": base64.b64encode(fixed_content.encode("utf-8")).decode("ascii"),
+                "branch": branch,
+                "sha": base_file.sha,
+            },
+        )
+
+        head = branch
+        if head_repository != repository:
+            head = f"{head_repository.split('/', 1)[0]}:{branch}"
+        pull_request = self._request_json(
+            "POST",
+            self._pulls_url(repository),
+            {
+                "title": title,
+                "head": head,
+                "base": base_branch,
+                "body": body,
+                "draft": draft,
+            },
+        )
+        if not isinstance(pull_request, dict):
+            raise RuntimeError("GitHub returned an invalid pull request response")
+        pull_request["head_repository"] = head_repository
+        pull_request["branch"] = branch
+        return pull_request
+
     def _get_json(self, url: str) -> Any:
+        return self._request_json("GET", url)
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Any:
         headers = {"Accept": "application/vnd.github+json"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        request = Request(url, headers=headers)
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/vnd.github+json"
+        request = Request(url, data=data, headers=headers, method=method)
         try:
             with urlopen(
                 request,
                 timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
             ) as response:  # noqa: S310 - URL is constructed from caller input.
-                return json.loads(response.read().decode("utf-8"))
+                body = response.read().decode("utf-8")
         except TimeoutError as error:
             raise RuntimeError(
                 f"GitHub request timed out after {GITHUB_REQUEST_TIMEOUT_SECONDS} seconds"
             ) from error
+        except Exception as error:
+            detail = getattr(error, "read", lambda: b"")()
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", errors="replace")
+            if detail:
+                try:
+                    detail = json.loads(detail).get("message", detail)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            raise RuntimeError(
+                f"GitHub API request failed for {method} {url}: {detail or error}"
+            ) from error
+        if not body.strip():
+            return {}
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("GitHub returned invalid JSON") from error
 
     @staticmethod
     def _run_wiki_clone(command: list[str], environment: dict[str, str]) -> None:
@@ -260,6 +379,26 @@ class GitHubClient:
         # `master` for a Wiki).
         ref_query = "" if ref == "HEAD" else f"?ref={quote(ref, safe='')}"
         return f"{self.api_base_url}/repos/{repository_path}/contents{suffix}{ref_query}"
+
+    def _git_ref_url(self, repository: str, branch: str) -> str:
+        repository_path = quote(repository, safe="/")
+        encoded_branch = quote(branch, safe="")
+        return f"{self.api_base_url}/repos/{repository_path}/git/ref/heads/{encoded_branch}"
+
+    def _git_refs_url(self, repository: str) -> str:
+        repository_path = quote(repository, safe="/")
+        return f"{self.api_base_url}/repos/{repository_path}/git/refs"
+
+    def _pulls_url(self, repository: str) -> str:
+        repository_path = quote(repository, safe="/")
+        return f"{self.api_base_url}/repos/{repository_path}/pulls"
+
+    @staticmethod
+    def _fix_branch_name(path: str) -> str:
+        file_name = PurePosixPath(path).name.removesuffix(".sh")
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", file_name).strip("-")
+        return f"buildguard/fix/{safe_name or 'build-script'}-{stamp}"
 
     def _resolve_ref(self, ref: str | None) -> str:
         return ref or self.default_ref

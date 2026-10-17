@@ -117,6 +117,7 @@ class BashSemanticParser:
         #   git checkout "$JAVA_BASE_COMMIT"
         facts = parse_semantic_facts(script)
         unused_configuration = self._unused_configuration_names(script, facts)
+        shell_failure_labels = self._shell_failure_labels(script)
 
         steps: list[BuildStep] = []
 
@@ -159,6 +160,7 @@ class BashSemanticParser:
                 context_labels=self._context_labels(
                     node.text,
                     unused_configuration,
+                    shell_failure_labels,
                 ),
                 previous_step_id=previous_id,
                 next_step_id=next_id,
@@ -688,15 +690,41 @@ class BashSemanticParser:
     def _context_labels(
         command: str,
         unused_configuration: set[str],
+        shell_failure_labels: list[str] | None = None,
     ) -> list[str]:
-        """Label configuration declarations without treating them as actions."""
+        """Attach script-wide shell semantics and configuration labels.
+
+        ``set -e -o pipefail`` is not a build action by itself, but it changes
+        the failure behavior of every later command. Keeping that fact on the
+        parsed operations lets the comparison layer distinguish an explicit
+        Wiki error handler from equivalent script-wide Bash behavior.
+        """
+        labels = list(shell_failure_labels or [])
         match = _ASSIGNMENT.match(command.strip())
         if not match:
-            return []
+            return labels
 
-        labels = ["configuration"]
+        labels.append("configuration")
         if match.group("name") in unused_configuration:
             labels.append("unused_configuration")
+        return labels
+
+    @staticmethod
+    def _shell_failure_labels(script: str) -> list[str]:
+        """Return global Bash options that affect command failure behavior."""
+        set_commands = re.findall(
+            r"(?m)^\s*set\b([^\n#]*)",
+            script,
+        )
+        options = " ".join(set_commands).lower()
+        labels: list[str] = []
+        if re.search(r"(?:^|\s)(?:-e|--errexit)(?:\s|$)", options) or re.search(
+            r"(?:^|\s)-o\s+errexit(?:\s|$)",
+            options,
+        ):
+            labels.append("shell_errexit")
+        if re.search(r"(?:^|\s)(?:-o\s+)?pipefail(?:\s|$)", options):
+            labels.append("shell_pipefail")
         return labels
 
     @staticmethod

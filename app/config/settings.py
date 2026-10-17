@@ -2,6 +2,23 @@
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ENV_FILE = PROJECT_ROOT / ".env"
+
+
+def load_project_environment() -> bool:
+    """Load only the repository-root environment file.
+
+    Entry points call this explicitly so python-dotenv cannot select a
+    different ``.env`` based on the directory from which the command starts.
+    Existing shell environment variables still take precedence.
+    """
+    return load_dotenv(dotenv_path=PROJECT_ENV_FILE, override=False)
 
 
 @dataclass(frozen=True)
@@ -70,6 +87,17 @@ class Settings:
         )
     )
 
+    github_pr_head_repo: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_PR_HEAD_REPO") or None
+    )
+
+    github_pr_draft: bool = field(
+        default_factory=lambda: os.getenv(
+            "BUILDGUARD_PR_DRAFT",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    )
+
     buildguard_database_path: str = field(
         default_factory=lambda: os.getenv(
             "BUILDGUARD_DATABASE_PATH",
@@ -79,6 +107,11 @@ class Settings:
 
     github_webhook_secret: str | None = field(
         default_factory=lambda: os.getenv("GITHUB_WEBHOOK_SECRET")
+    )
+
+    buildguard_api_secret: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_API_SECRET")
+        or os.getenv("GITHUB_WEBHOOK_SECRET")
     )
 
     webhook_host: str = field(

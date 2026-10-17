@@ -7,9 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-from app.config.settings import Settings
+from app.config.settings import Settings, load_project_environment
 from app.reporting.reporter import render_report
 from app.service import run_package_comparison
 
@@ -18,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run the BuildGuard Wiki + Bash parsing pipeline."""
     arguments = _arguments(argv)
 
-    load_dotenv()
+    load_project_environment()
 
     try:
         settings = Settings()

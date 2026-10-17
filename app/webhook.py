@@ -12,7 +12,7 @@ from pathlib import PurePosixPath
 from threading import Lock
 from typing import Any
 
-from app.config.settings import Settings
+from app.config.settings import Settings, load_project_environment
 from app.parsers.version_parser import product_from_module
 from app.service import synchronize_package_cache
 
@@ -224,6 +224,7 @@ class _WebhookHandler(BaseHTTPRequestHandler):
 def main() -> None:
     """Run the standalone GitHub webhook listener."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    load_project_environment()
     settings = Settings()
     if not settings.github_webhook_secret:
         raise SystemExit("Set GITHUB_WEBHOOK_SECRET before starting the webhook listener")

@@ -38,6 +38,7 @@ _IMPLEMENTATION_ACTIONS = {
     ActionType.DELETE,
     ActionType.COPY,
     ActionType.MOVE,
+    ActionType.REMOVE_PACKAGE,
 }
 
 _JAVA_WORDS = {
@@ -56,6 +57,10 @@ _COMPONENT_ALIASES = {
     "content-app": {"content_app", "content-app", "contentapp"},
     "docker-compose": {"docker_compose", "docker-compose", "compose"},
 }
+_EXPLICIT_FAILURE_HANDLER = re.compile(
+    r"\s+\|\|\s*(?:error|fail|die|fatal)\b.*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def normalize_command(command: str) -> str:
@@ -305,8 +310,328 @@ def _normalize_package(value: str) -> str:
     return value
 
 
+_PACKAGE_NOISE = {
+    "|&",
+    "tee",
+    "$log_file",
+    "<var>",
+}
+
+_GENERIC_PACKAGES = {
+    "build-essential",
+    "clang",
+    "cmake",
+    "curl",
+    "diffutils",
+    "gawk",
+    "gcc",
+    "gcc-c++",
+    "git",
+    "gnupg",
+    "libssl-dev",
+    "lld",
+    "make",
+    "ninja",
+    "ninja-build",
+    "patch",
+    "pkg-config",
+    "protobuf",
+    "protobuf-devel",
+    "python3",
+    "python3-dev",
+    "python3-devel",
+    "python3-pip",
+    "python3-venv",
+    "software-properties-common",
+    "unzip",
+    "wget",
+    "which",
+}
+
+
+def _meaningful_packages(step: BuildStep) -> set[str]:
+    packages = set(step.packages)
+    for command in step.commands:
+        packages.update(_packages_from_command(command))
+    return {
+        _normalize_package(package)
+        for package in packages
+        if _normalize_package(package) not in _PACKAGE_NOISE
+    }
+
+
+def _packages_from_command(command: str) -> set[str]:
+    """Extract package names from package-manager commands and bare package lines."""
+    try:
+        words = shlex.split(command, comments=False)
+    except ValueError:
+        words = command.split()
+    if not words:
+        return set()
+
+    manager_index = next(
+        (
+            index
+            for index, word in enumerate(words[:-1])
+            if word in {"apt", "apt-get", "dnf", "yum", "zypper"}
+            and words[index + 1] in {"install", "remove"}
+        ),
+        None,
+    )
+    if manager_index is not None:
+        packages: set[str] = set()
+        for word in words[manager_index + 2:]:
+            if word in {"|", "|&", "&&", ";"} or word.startswith((">", "<")):
+                break
+            if not word.startswith("-"):
+                packages.add(word)
+        return packages
+
+    if (
+        len(words) >= 2
+        and not any(
+            word in {
+                "sudo",
+                "apt",
+                "apt-get",
+                "dnf",
+                "yum",
+                "zypper",
+                "update",
+                "install",
+                "remove",
+                "source",
+                "cd",
+                "wget",
+                "curl",
+                "git",
+                "chmod",
+                "rm",
+                "ln",
+                "sed",
+            }
+            for word in words
+        )
+        and all(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*", word)
+        for word in words
+        )
+    ):
+        return set(words)
+    return set()
+
+
+def _canonical_repository(value: str) -> str:
+    return value.strip().lower().rstrip("/").removesuffix(".git")
+
+
+def _step_urls(step: BuildStep) -> set[str]:
+    urls = {url.strip().lower().rstrip("/") for url in step.urls if url}
+    urls.update(
+        url.lower().rstrip("/")
+        for url in re.findall(r"https?://[^\s\"']+", " ".join(step.commands))
+    )
+    return urls
+
+
+def _strong_identity_candidates(
+    wiki_step: BuildStep,
+    bash_steps: list[BuildStep],
+) -> list[BuildStep]:
+    """Find Bash steps whose source identity is stronger than text similarity."""
+    if wiki_step.repository:
+        repository = _canonical_repository(wiki_step.repository)
+        candidates = [
+            step
+            for step in bash_steps
+            if step.repository
+            and _canonical_repository(step.repository) == repository
+        ]
+        if candidates:
+            return candidates
+
+    wiki_urls = _step_urls(wiki_step)
+    if wiki_urls:
+        candidates = [
+            step for step in bash_steps if wiki_urls & _step_urls(step)
+        ]
+        if candidates:
+            return candidates
+
+    if wiki_step.component:
+        component = re.sub(r"[^a-z0-9]+", "-", wiki_step.component.lower()).strip("-")
+        candidates = [
+            step
+            for step in bash_steps
+            if step.component
+            and re.sub(r"[^a-z0-9]+", "-", step.component.lower()).strip("-")
+            == component
+        ]
+        if candidates:
+            return candidates
+
+    wiki_packages = _meaningful_packages(wiki_step)
+    if not wiki_packages:
+        return []
+    candidates: list[BuildStep] = []
+    for step in bash_steps:
+        if not _action_compatible(wiki_step, step):
+            continue
+        common = wiki_packages & _meaningful_packages(step)
+        if not common:
+            continue
+        script_packages = _meaningful_packages(step)
+        specific_common = {
+            package
+            for package in common
+            if package not in _GENERIC_PACKAGES
+            or re.search(r"\d{2,}", package)
+        }
+        if (
+            common == wiki_packages
+            or common == script_packages
+            or len(common) >= 2 and specific_common
+        ):
+            candidates.append(step)
+    return candidates
+
+
+def _identity_strength(wiki_step: BuildStep, script_step: BuildStep) -> float:
+    """Rank exact source identities so broad package subsets do not win."""
+    if (
+        wiki_step.repository
+        and script_step.repository
+        and _canonical_repository(wiki_step.repository)
+        == _canonical_repository(script_step.repository)
+    ):
+        return 1.0
+    if _step_urls(wiki_step) & _step_urls(script_step):
+        return 0.95
+    if (
+        wiki_step.component
+        and script_step.component
+        and wiki_step.component.lower() == script_step.component.lower()
+    ):
+        return 0.90
+    wiki_packages = _meaningful_packages(wiki_step)
+    script_packages = _meaningful_packages(script_step)
+    if not wiki_packages or not script_packages:
+        return 0.0
+    common = wiki_packages & script_packages
+    return 0.50 + 0.40 * len(common) / len(wiki_packages) if common else 0.0
+
+
+def _remove_automation_step(match: StepMatch, step_id: str) -> None:
+    steps = [
+        step
+        for step in (match.automation_steps or ([match.automation_step] if match.automation_step else []))
+        if step.id != step_id
+    ]
+    match.automation_steps = steps
+    match.automation_step = steps[0] if steps else None
+    if not steps and match.status in {MatchStatus.MATCHED, MatchStatus.CONFLICT}:
+        match.status = MatchStatus.MISSING
+        match.category = DiscrepancyCategory.MISSING_STEP
+
+
+def _reconcile_strong_matches(
+    matches: list[StepMatch],
+    wiki: BuildInstruction,
+    bash: BuildInstruction,
+) -> None:
+    """Correct provider assignments when structured source identity disagrees."""
+    by_wiki = {
+        match.wiki_step.id: match
+        for match in matches
+        if match.wiki_step is not None
+    }
+
+    for wiki_step in wiki.steps:
+        target = by_wiki.get(wiki_step.id)
+        if target is None:
+            continue
+        candidates = _strong_identity_candidates(wiki_step, bash.steps)
+        if not candidates:
+            continue
+        # Package overlap is useful for grouping platform dependency blocks,
+        # but it is weaker than an exact repository or URL. Do not steal a
+        # package command that is already attached to another meaningful Wiki
+        # action; only reclaim unassigned/extra commands in that case.
+        if not (wiki_step.repository or _step_urls(wiki_step) or wiki_step.component):
+            available_candidates: list[BuildStep] = []
+            for candidate in candidates:
+                owner = next(
+                    (
+                        match
+                        for match in matches
+                        if candidate.id in {
+                            step.id
+                            for step in (
+                                match.automation_steps
+                                or ([match.automation_step] if match.automation_step else [])
+                            )
+                        }
+                    ),
+                    None,
+                )
+                if owner is None or owner is target or owner.status in {
+                    MatchStatus.EXTRA,
+                    MatchStatus.IMPLEMENTATION_DETAIL,
+                }:
+                    available_candidates.append(candidate)
+            candidates = available_candidates
+            if not candidates:
+                continue
+        target_steps = target.automation_steps or (
+            [target.automation_step] if target.automation_step else []
+        )
+        candidate_ids = {candidate.id for candidate in candidates}
+        if candidate_ids.issubset({step.id for step in target_steps}):
+            continue
+
+        for candidate in candidates:
+            owner = next(
+                (
+                    match
+                    for match in matches
+                    if candidate.id in {
+                        step.id
+                        for step in (
+                            match.automation_steps
+                            or ([match.automation_step] if match.automation_step else [])
+                        )
+                    }
+                ),
+                None,
+            )
+            if owner is not None and owner is not target:
+                _remove_automation_step(owner, candidate.id)
+
+        # A wrong repository/component assignment should not survive beside
+        # the exact source identity. The normal grouping pass can add back
+        # related patch/build commands after the correct anchor is installed.
+        target.automation_steps = candidates
+        target.automation_step = candidates[0]
+        if _group_conflicts(wiki_step, candidates):
+            target.status = MatchStatus.CONFLICT
+            target.category = DiscrepancyCategory.VERSION_INCONSISTENCY
+        else:
+            target.status = MatchStatus.MATCHED
+            target.category = None
+        target.explanation = (
+            "Matched by exact repository, URL, component, or package identity; "
+            "the provider's weaker text-based assignment was corrected."
+        )
+
+
 def _semantic_score(wiki: BuildStep, script: BuildStep) -> float:
     score = similarity(wiki, script)
+    command_overlap = _command_intents(wiki) & _command_intents(script)
+    if command_overlap:
+        # A Wiki block may contain several commands while Bash exposes them
+        # as separate steps. Matching the normalized command intents lets
+        # mkdir/cp/extract/configure operations form one semantic action.
+        score += min(0.56, 0.46 + len(command_overlap) * 0.08)
     wiki_families = _families(wiki)
     script_families = _families(script)
     family_overlap = wiki_families & script_families
@@ -328,6 +653,87 @@ def _semantic_score(wiki: BuildStep, script: BuildStep) -> float:
     return min(score, 1.0)
 
 
+def _command_intents(step: BuildStep) -> set[str]:
+    return {
+        normalized
+        for command in step.commands
+        if (normalized := normalize_command(command))
+    }
+
+
+def _command_intents_without_failure_handler(step: BuildStep) -> set[str]:
+    """Normalize commands after removing explicit shell error-reporting syntax."""
+    return {
+        normalized
+        for command in step.commands
+        if (
+            normalized := normalize_command(
+                _EXPLICIT_FAILURE_HANDLER.sub("", command).strip()
+            )
+        )
+    }
+
+
+def _has_global_pipeline_failure_protection(step: BuildStep) -> bool:
+    labels = set(step.context.context_labels)
+    return {"shell_errexit", "shell_pipefail"}.issubset(labels)
+
+
+def _patch_targets(step: BuildStep) -> set[str]:
+    values = list(step.patches) + list(step.paths)
+    values.extend(
+        re.findall(r"[A-Za-z0-9_.-]+\.patch\b", " ".join(step.commands), re.I)
+    )
+    return {
+        value.rsplit("/", 1)[-1].lower()
+        for value in values
+        if value.lower().endswith(".patch")
+    }
+
+
+def _is_failure_handling_only_conflict(match: StepMatch) -> bool:
+    """Treat explicit Wiki error reporting as equivalent to safe Bash defaults.
+
+    A Wiki often writes ``command || error \"step\"`` while a script enables
+    ``set -e -o pipefail`` once at the top. The latter is not a missing build
+    operation; it is a different way to propagate the same failure. This
+    exception is deliberately narrow: the underlying normalized operations
+    must match, all relevant script steps must carry both shell options, and
+    concrete patch targets must not disagree.
+    """
+    if match.status != MatchStatus.CONFLICT:
+        return False
+    wiki = match.wiki_step
+    script_steps = match.automation_steps or (
+        [match.automation_step] if match.automation_step else []
+    )
+    if wiki is None or not script_steps:
+        return False
+    if not any(_EXPLICIT_FAILURE_HANDLER.search(command) for command in wiki.commands):
+        return False
+    if not all(_has_global_pipeline_failure_protection(step) for step in script_steps):
+        return False
+
+    wiki_core = _command_intents_without_failure_handler(wiki)
+    script_core = {
+        intent
+        for step in script_steps
+        for intent in _command_intents_without_failure_handler(step)
+    }
+    if not wiki_core or not wiki_core.issubset(script_core):
+        return False
+
+    wiki_patches = _patch_targets(wiki)
+    script_patches = {
+        patch
+        for step in script_steps
+        for patch in _patch_targets(step)
+    }
+    if wiki_patches and script_patches and wiki_patches.isdisjoint(script_patches):
+        return False
+    return not _group_conflicts(wiki, script_steps)
+
+
 def _same_workflow(wiki: BuildStep, primary: BuildStep, candidate: BuildStep) -> bool:
     primary_families = _families(primary)
     candidate_families = _families(candidate)
@@ -335,6 +741,14 @@ def _same_workflow(wiki: BuildStep, primary: BuildStep, candidate: BuildStep) ->
     wiki_text = _text(wiki)
 
     if candidate_function == "cleanup":
+        return False
+    wiki_commands = _command_intents(wiki)
+    primary_commands = _command_intents(primary)
+    if wiki_commands & _command_intents(candidate):
+        return True
+    if wiki_commands & primary_commands:
+        # The Wiki action already has a concrete command anchor. Do not pull
+        # unrelated nearby commands from the same Bash helper into it.
         return False
     if "java" in _families(wiki):
         wiki_component = (wiki.component or "").lower()
@@ -379,6 +793,24 @@ def _same_workflow(wiki: BuildStep, primary: BuildStep, candidate: BuildStep) ->
         ):
             return False
         return True
+
+    # A repository, URL, component, or package identity can anchor a larger
+    # documented platform/workflow block even when the shell parser has no
+    # function name for the surrounding commands. This covers, for example,
+    # the Ubuntu LLVM download followed by lld installation and compiler
+    # configuration.
+    if (
+        not primary_families
+        and not primary.context.subsection
+        and not candidate.context.subsection
+        and -3 <= candidate.order - primary.order <= 4
+        and _strong_identity_candidates(wiki, [primary])
+        and (
+            _action_compatible(primary, candidate)
+            or _is_implementation_detail(candidate)
+        )
+    ):
+        return True
     if primary.component and candidate.component and primary.component.lower() == candidate.component.lower():
         return True
     if primary.repository and candidate.repository and primary.repository.lower() == candidate.repository.lower():
@@ -417,8 +849,14 @@ def _group_for(wiki: BuildStep, script_steps: list[BuildStep]) -> tuple[list[Bui
         key=lambda item: item[0],
         reverse=True,
     )
+    identity_ids = {
+        step.id
+        for step in _strong_identity_candidates(wiki, candidates)
+    }
     scored.sort(
         key=lambda item: (
+            item[1].id in identity_ids,
+            _identity_strength(wiki, item[1]),
             item[0],
             not _is_implementation_detail(item[1]),
         ),
@@ -430,7 +868,7 @@ def _group_for(wiki: BuildStep, script_steps: list[BuildStep]) -> tuple[list[Bui
     score, primary = scored[0]
     wiki_families = _families(wiki)
     threshold = 0.42 if "java" in wiki_families else 0.52
-    if score < threshold:
+    if score < threshold and primary.id not in identity_ids:
         return [], score
 
     group = [primary]
@@ -560,6 +998,16 @@ def normalize_validation_result(
 ) -> ValidationResult:
     """Replace command-level extras with grouped semantic classifications."""
     matches = [match.model_copy(deep=True) for match in result.matches]
+    _reconcile_strong_matches(matches, wiki, bash)
+    matches = [
+        match
+        for match in matches
+        if not (
+            match.status == MatchStatus.EXTRA
+            and match.automation_step is None
+            and not match.automation_steps
+        )
+    ]
     for match in matches:
         if match.automation_step is not None and not match.automation_steps:
             match.automation_steps = [match.automation_step]
@@ -568,6 +1016,22 @@ def normalize_validation_result(
         for match in matches
         if match.wiki_step is not None
     }
+
+    # Do not turn a shell error-reporting style difference into a build
+    # discrepancy. For example, ``git apply || error ...`` in the Wiki and
+    # ``set -e -o pipefail`` plus ``git apply`` in Bash have the same build
+    # failure semantics.
+    for match in matches:
+        if not _is_failure_handling_only_conflict(match):
+            continue
+        match.status = MatchStatus.MATCHED
+        match.category = None
+        match.recommendation = None
+        match.explanation = (
+            "The Wiki and script perform the same operation. The Wiki adds an "
+            "explicit error handler, while the script's global 'set -e -o "
+            "pipefail' already propagates command and pipeline failures."
+        )
 
     # First recover Wiki steps that the provider called missing but that are
     # implemented by a parameterized or multi-command script workflow.

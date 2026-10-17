@@ -7,6 +7,7 @@ from app.config.settings import Settings
 from app.intelligence.request import LLMRequest
 from app.intelligence.response import LLMResponse
 from app.pipeline.build_pipeline import BuildPipeline
+from app.sources.github import GitHubFile
 
 
 class FakeResponse:
@@ -150,3 +151,53 @@ def test_client_lists_building_wiki_modules(monkeypatch) -> None:
     client = GitHubClient(repository="example/docs")
 
     assert client.list_wiki_modules() == ["Building-Alfresco", "Building-Share"]
+
+
+def test_client_creates_file_pull_request_from_current_base(monkeypatch) -> None:
+    client = GitHubClient(token="write-token")
+    requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+    monkeypatch.setattr(
+        client,
+        "fetch_file",
+        lambda repository, path, ref: GitHubFile(
+            repository=repository,
+            ref=ref or "master",
+            path=path,
+            filename="build.sh",
+            github_url="https://github.com/example/scripts/blob/master/build.sh",
+            content="echo original\n",
+            sha="file-sha",
+        ),
+    )
+
+    def fake_get(url: str):
+        assert url.endswith("/git/ref/heads/master")
+        return {"object": {"sha": "base-sha"}}
+
+    def fake_request(method: str, url: str, payload=None):
+        requests.append((method, url, payload))
+        if url.endswith("/pulls"):
+            return {"number": 7, "html_url": "https://github.com/example/scripts/pull/7"}
+        return {}
+
+    monkeypatch.setattr(client, "_get_json", fake_get)
+    monkeypatch.setattr(client, "_request_json", fake_request)
+
+    result = client.create_file_pull_request(
+        repository="example/scripts",
+        head_repository=None,
+        base_branch="master",
+        path="Bazel/9.2.0/build_bazel.sh",
+        original_content="echo original\n",
+        fixed_content="echo fixed\n",
+        title="BuildGuard: fix Bazel build script",
+        body="Generated fix.",
+    )
+
+    assert result["number"] == 7
+    assert result["head_repository"] == "example/scripts"
+    assert [request[0] for request in requests] == ["POST", "PUT", "POST"]
+    assert requests[0][2]["sha"] == "base-sha"
+    assert requests[1][2]["sha"] == "file-sha"
+    assert requests[1][2]["content"]

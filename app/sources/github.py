@@ -25,6 +25,7 @@ class GitHubFile(GitHubSource):
     """Text content and its GitHub location metadata."""
 
     content: str
+    sha: str | None = None
 
 
 class GitHubWikiPage(GitHubFile):
