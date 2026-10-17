@@ -21,3 +21,24 @@ def test_bash_parser_does_not_assign_command_specific_semantics() -> None:
     assert command.kind == "command"
     assert command.words == ["sudo", "dnf", "install", "-y", "git", "curl", "wget"]
     assert not hasattr(command, "action")
+
+
+def test_bash_parser_accepts_quoted_heredoc_delimiters() -> None:
+    script = "cat <<'EOF'\ninternal configuration\nEOF\nprintf done\n"
+
+    parsed = parse_script(script)
+
+    assert [node.kind for node in parsed.nodes] == ["command", "command"]
+    assert parsed.nodes[0].text == "cat <<'EOF"
+    assert parsed.nodes[1].text == "printf done"
+    assert parsed.nodes[1].position_start == script.index("printf")
+
+
+def test_bash_parser_accepts_dash_quoted_heredoc_delimiters() -> None:
+    script = "cat <<-'EOF'\n\tinternal configuration\n\tEOF\nprintf done\n"
+
+    parsed = parse_script(script)
+
+    assert [node.kind for node in parsed.nodes] == ["command", "command"]
+    assert parsed.nodes[0].text == "cat <<-'EOF"
+    assert parsed.nodes[1].text == "printf done"

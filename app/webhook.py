@@ -3,21 +3,35 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
 import logging
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import PurePosixPath
 from threading import Lock
 from typing import Any
 
 from app.config.settings import Settings, load_project_environment
+from app.package_mapping import canonical_wiki_package, wiki_package_for_script_path
 from app.parsers.version_parser import product_from_module
-from app.service import synchronize_package_cache
+from app.service import run_automated_package_review
+from app.storage.repository import ParsedSourceRepository, WebhookJob
 
 LOGGER = logging.getLogger("buildguard.webhook")
 WEBHOOK_PATH = "/github/webhook"
+
+
+@dataclass(frozen=True)
+class WebhookTarget:
+    """A package/version affected by one GitHub event."""
+
+    package: str
+    version: str | None
+    refresh_wiki: bool
+    refresh_bash: bool
 
 
 def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
@@ -33,64 +47,119 @@ def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
 
 
 class WebhookProcessor:
-    """Turn GitHub events into deduplicated background cache refreshes."""
+    """Turn GitHub events into durable, deduplicated review jobs."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.lock = Lock()
-        self.pending: dict[str, tuple[bool, bool]] = {}
+        self.cache = ParsedSourceRepository(settings.buildguard_database_path)
+        self.cache.recover_webhook_jobs()
+        self.scheduled: set[tuple[str, str | None]] = set()
+        self.package_locks: dict[str, Lock] = {}
+        for job in self.cache.list_pending_webhook_jobs():
+            self._schedule(job)
 
     def submit_event(self, event: str, payload: dict[str, Any]) -> int:
-        package_jobs: dict[str, tuple[bool, bool]] = {}
-        for package, refresh_wiki, refresh_bash in _cache_jobs(
-            event,
-            payload,
-            self.settings,
-        ):
-            existing = package_jobs.get(package, (False, False))
-            package_jobs[package] = (
-                existing[0] or refresh_wiki,
-                existing[1] or refresh_bash,
+        targets = _webhook_targets(event, payload, self.settings)
+        for target in targets:
+            job = self.cache.enqueue_webhook_job(
+                package=target.package,
+                version=target.version,
+                refresh_wiki=target.refresh_wiki,
+                refresh_bash=target.refresh_bash,
             )
+            self._schedule(job)
+        return len(targets)
 
-        for package, (refresh_wiki, refresh_bash) in package_jobs.items():
-            self._enqueue(package, refresh_wiki, refresh_bash)
-        return len(package_jobs)
-
-    def _enqueue(
-        self,
-        package: str,
-        refresh_wiki: bool,
-        refresh_bash: bool,
-    ) -> None:
+    def _schedule(self, job: WebhookJob) -> None:
+        key = (job.package, job.version)
         with self.lock:
-            existing = self.pending.get(package)
-            if existing is not None:
-                self.pending[package] = (
-                    existing[0] or refresh_wiki,
-                    existing[1] or refresh_bash,
-                )
+            if key in self.scheduled:
                 return
-            self.pending[package] = (refresh_wiki, refresh_bash)
+            self.scheduled.add(key)
+        self.executor.submit(self._refresh, job.job_id, key)
 
-        self.executor.submit(self._refresh, package)
+    def _refresh(self, job_id: int, key: tuple[str, str | None]) -> None:
+        # A docs job (version unknown) and a script job (version known) can be
+        # created by the same commit. Serialize them per package so they do
+        # not both start an expensive AI comparison before the first report is
+        # saved.
+        with self.lock:
+            package_lock = self.package_locks.setdefault(key[0], Lock())
+        with package_lock:
+            self._refresh_locked(job_id, key)
 
-    def _refresh(self, package: str) -> None:
+    def _refresh_locked(self, job_id: int, key: tuple[str, str | None]) -> None:
         try:
-            with self.lock:
-                refresh_wiki, refresh_bash = self.pending.get(package, (False, False))
-            synchronize_package_cache(
-                package,
-                self.settings,
-                refresh_wiki=refresh_wiki,
-                refresh_bash=refresh_bash,
-            )
+            while True:
+                job = self.cache.claim_webhook_job(job_id)
+                if job is None:
+                    return
+                try:
+                    outcome = run_automated_package_review(
+                        job.package,
+                        self.settings,
+                        progress=lambda message: LOGGER.info(
+                            "%s %s: %s",
+                            job.package,
+                            job.version or "latest",
+                            message,
+                        ),
+                        version=job.version,
+                        refresh_wiki=job.refresh_wiki,
+                        refresh_bash=job.refresh_bash,
+                    )
+                    pending = self.cache.finish_webhook_job(
+                        job.job_id,
+                        status=(
+                            "waiting"
+                            if outcome.status.startswith("waiting_")
+                            else "failed"
+                            if outcome.status == "followup_failed"
+                            else "complete"
+                        ),
+                        last_error=outcome.message,
+                        retryable=(
+                            outcome.status == "followup_failed"
+                            and job.attempts < 3
+                        ),
+                    )
+                    if (
+                        pending
+                        and outcome.status == "followup_failed"
+                        and job.attempts < 3
+                    ):
+                        time.sleep(min(2 ** job.attempts, 8))
+                except Exception as error:
+                    LOGGER.exception(
+                        "Unable to process BuildGuard webhook job for %s",
+                        job.package,
+                    )
+                    pending = self.cache.finish_webhook_job(
+                        job.job_id,
+                        status="failed",
+                        last_error=str(error) or error.__class__.__name__,
+                        retryable=job.attempts < 3,
+                    )
+                    if pending and job.attempts < 3:
+                        time.sleep(min(2 ** job.attempts, 8))
+                if not pending:
+                    return
         except Exception:
-            LOGGER.exception("Unable to refresh BuildGuard cache for %s", package)
+            LOGGER.exception("Unable to finalize BuildGuard webhook job for %s", key[0])
         finally:
             with self.lock:
-                self.pending.pop(package, None)
+                self.scheduled.discard(key)
+            # An event can arrive between the final database update and the
+            # in-memory scheduling cleanup. Re-check durable state so it is
+            # never stranded without a worker.
+            pending = self.cache.get_active_webhook_job(
+                package=key[0],
+                version=key[1],
+            )
+            if pending is not None:
+                self._schedule(pending)
 
 
 def _cache_jobs(
@@ -98,13 +167,32 @@ def _cache_jobs(
     payload: dict[str, Any],
     settings: Settings,
 ) -> set[tuple[str, bool, bool]]:
+    """Compatibility view used by callers that only need package-level flags."""
+    jobs: dict[str, tuple[bool, bool]] = {}
+    for target in _webhook_targets(event, payload, settings):
+        existing = jobs.get(target.package, (False, False))
+        jobs[target.package] = (
+            existing[0] or target.refresh_wiki,
+            existing[1] or target.refresh_bash,
+        )
+    return {
+        (package, refresh_wiki, refresh_bash)
+        for package, (refresh_wiki, refresh_bash) in jobs.items()
+    }
+
+
+def _webhook_targets(
+    event: str,
+    payload: dict[str, Any],
+    settings: Settings,
+) -> set[WebhookTarget]:
     repository = payload.get("repository") or {}
     repository_name = repository.get("full_name")
     if not isinstance(repository_name, str):
         return set()
 
     if event == "gollum" and repository_name == settings.github_repo:
-        jobs: set[tuple[str, bool, bool]] = set()
+        jobs: set[WebhookTarget] = set()
         for page in payload.get("pages") or []:
             if not isinstance(page, dict):
                 continue
@@ -112,23 +200,38 @@ def _cache_jobs(
             if not isinstance(page_name, str):
                 continue
             if page_name.casefold().startswith("building-"):
-                jobs.add((product_from_module(page_name), True, False))
+                jobs.add(
+                    WebhookTarget(
+                        canonical_wiki_package(product_from_module(page_name)),
+                        None,
+                        True,
+                        False,
+                    )
+                )
         return jobs
 
     if event != "push":
         return set()
 
+    if not _push_matches_branch(payload, settings, repository_name):
+        return set()
+
     changed_paths = _changed_paths(payload)
     if repository_name == settings.github_repo:
         return {
-            (product_from_module(path.name), True, False)
+            WebhookTarget(
+                canonical_wiki_package(product_from_module(path.name)),
+                None,
+                True,
+                False,
+            )
             for path in map(PurePosixPath, changed_paths)
             if path.suffix.casefold() == ".md"
             and path.name.casefold().startswith("building-")
         }
 
     if repository_name == settings.scripts_repo:
-        jobs = set()
+        jobs: set[WebhookTarget] = set()
         for raw_path in changed_paths:
             path = PurePosixPath(raw_path)
             parts = path.parts
@@ -137,10 +240,29 @@ def _cache_jobs(
                 and parts[1]
                 and path.suffix.casefold() == ".sh"
             ):
-                jobs.add((parts[0], False, True))
+                jobs.add(
+                    WebhookTarget(
+                        wiki_package_for_script_path(raw_path),
+                        parts[1],
+                        False,
+                        True,
+                    )
+                )
         return jobs
 
     return set()
+
+
+def _push_matches_branch(
+    payload: dict[str, Any],
+    settings: Settings,
+    repository_name: str,
+) -> bool:
+    ref = payload.get("ref")
+    configured = settings.scripts_branch if repository_name == settings.scripts_repo else settings.github_branch
+    if not isinstance(ref, str) or configured == "HEAD":
+        return True
+    return ref == f"refs/heads/{configured}"
 
 
 def _changed_paths(payload: dict[str, Any]) -> set[str]:

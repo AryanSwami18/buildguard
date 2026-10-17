@@ -14,7 +14,7 @@ from app.service import (
 )
 from app.sources.github import GitHubWikiPage
 from app.storage.repository import ParsedSourceRepository
-from app.webhook import _cache_jobs, verify_signature
+from app.webhook import _cache_jobs, _webhook_targets, verify_signature, WebhookTarget
 
 
 def _instruction(source: str, name: str, version: str | None = None) -> BuildInstruction:
@@ -181,6 +181,50 @@ def test_webhook_jobs_cover_wiki_changes_and_new_script_files() -> None:
     }
     assert _cache_jobs("push", script_payload, settings) == {
         ("Alfresco", False, True)
+    }
+
+
+def test_script_webhook_target_preserves_package_version_and_branch() -> None:
+    settings = Settings(
+        github_repo="example/docs",
+        scripts_repo="example/scripts",
+        scripts_branch="master",
+    )
+    payload = {
+        "repository": {"full_name": "example/scripts"},
+        "ref": "refs/heads/master",
+        "commits": [
+            {
+                "modified": ["Alfresco/26.0.0/build_alfresco.sh"],
+                "added": ["Bazel/9.2.0/build_bazel.sh"],
+            }
+        ],
+    }
+
+    assert _webhook_targets("push", payload, settings) == {
+        WebhookTarget("Alfresco", "26.0.0", False, True),
+        WebhookTarget("Bazel", "9.2.0", False, True),
+    }
+    payload["ref"] = "refs/heads/feature"
+    assert _webhook_targets("push", payload, settings) == set()
+
+
+def test_script_webhook_maps_repository_alias_to_wiki_package() -> None:
+    settings = Settings(
+        github_repo="example/docs",
+        scripts_repo="example/scripts",
+        scripts_branch="master",
+    )
+    payload = {
+        "repository": {"full_name": "example/scripts"},
+        "ref": "refs/heads/master",
+        "commits": [
+            {"modified": ["AntLR/4.13.2/build_antlr4.sh"]},
+        ],
+    }
+
+    assert _webhook_targets("push", payload, settings) == {
+        WebhookTarget("ANTLR-4", "4.13.2", False, True),
     }
 
 

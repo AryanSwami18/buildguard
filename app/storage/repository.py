@@ -44,6 +44,36 @@ class StoredComparisonReport:
     key: ComparisonCacheKey
 
 
+@dataclass(frozen=True)
+class WebhookJob:
+    """Persisted package/version work scheduled by a GitHub event."""
+
+    job_id: int
+    package: str
+    version: str | None
+    refresh_wiki: bool
+    refresh_bash: bool
+    status: str
+    attempts: int
+    last_error: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AutomationRun:
+    """Persisted post-comparison actions for one exact comparison key."""
+
+    run_key: str
+    package: str
+    version: str
+    report_id: int | None
+    status: str
+    pr_url: str | None
+    notification_sent: bool
+    last_error: str | None
+    updated_at: str
+
+
 class ParsedSourceRepository:
     """Store parsed Wiki/Bash instructions keyed by their remote revision."""
 
@@ -380,6 +410,256 @@ class ParsedSourceRepository:
                 reports.append(stored)
         return reports
 
+    def enqueue_webhook_job(
+        self,
+        *,
+        package: str,
+        version: str | None,
+        refresh_wiki: bool,
+        refresh_bash: bool,
+    ) -> WebhookJob:
+        """Create or merge pending work for one package/version."""
+        updated_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, refresh_wiki, refresh_bash
+                FROM webhook_jobs
+                WHERE package = ?
+                  AND version IS ?
+                  AND status IN ('pending', 'running')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (package, version),
+            ).fetchone()
+            if row is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO webhook_jobs (
+                        package, version, refresh_wiki, refresh_bash,
+                        status, attempts, last_error, updated_at
+                    ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?)
+                    """,
+                    (package, version, refresh_wiki, refresh_bash, updated_at),
+                )
+                job_id = int(cursor.lastrowid)
+            else:
+                job_id = int(row[0])
+                connection.execute(
+                    """
+                    UPDATE webhook_jobs
+                    SET refresh_wiki = ?,
+                        refresh_bash = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        bool(row[1]) or refresh_wiki,
+                        bool(row[2]) or refresh_bash,
+                        updated_at,
+                        job_id,
+                    ),
+                )
+        job = self.get_webhook_job(job_id)
+        if job is None:
+            raise RuntimeError("Webhook job could not be reloaded")
+        return job
+
+    def recover_webhook_jobs(self) -> None:
+        """Return jobs interrupted by a previous backend process to the queue."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE webhook_jobs
+                SET status = 'pending', updated_at = ?
+                WHERE status = 'running'
+                """,
+                (datetime.now(UTC).isoformat(),),
+            )
+
+    def get_webhook_job(self, job_id: int) -> WebhookJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, package, version, refresh_wiki, refresh_bash,
+                       status, attempts, last_error, updated_at
+                FROM webhook_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        return self._webhook_job(row)
+
+    def get_active_webhook_job(
+        self,
+        *,
+        package: str,
+        version: str | None,
+    ) -> WebhookJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, package, version, refresh_wiki, refresh_bash,
+                       status, attempts, last_error, updated_at
+                FROM webhook_jobs
+                WHERE package = ?
+                  AND version IS ?
+                  AND status IN ('pending', 'running')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (package, version),
+            ).fetchone()
+        return self._webhook_job(row)
+
+    def list_pending_webhook_jobs(self) -> list[WebhookJob]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, package, version, refresh_wiki, refresh_bash,
+                       status, attempts, last_error, updated_at
+                FROM webhook_jobs
+                WHERE status = 'pending'
+                ORDER BY id
+                """
+            ).fetchall()
+        return [job for row in rows if (job := self._webhook_job(row)) is not None]
+
+    def claim_webhook_job(self, job_id: int) -> WebhookJob | None:
+        """Atomically claim pending work and clear its queued refresh flags."""
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT id, package, version, refresh_wiki, refresh_bash,
+                       status, attempts, last_error, updated_at
+                FROM webhook_jobs
+                WHERE id = ? AND status = 'pending'
+                """,
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            connection.execute(
+                """
+                UPDATE webhook_jobs
+                SET status = 'running',
+                    refresh_wiki = 0,
+                    refresh_bash = 0,
+                    attempts = attempts + 1,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (datetime.now(UTC).isoformat(), job_id),
+            )
+        return WebhookJob(
+            job_id=int(current[0]),
+            package=str(current[1]),
+            version=current[2],
+            refresh_wiki=bool(current[3]),
+            refresh_bash=bool(current[4]),
+            status="running",
+            attempts=int(current[6]) + 1,
+            last_error=None,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+
+    def finish_webhook_job(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        last_error: str | None = None,
+        retryable: bool = False,
+    ) -> bool:
+        """Finish a job, retaining any new flags merged while it was running."""
+        if status not in {"complete", "waiting", "failed"}:
+            raise ValueError(f"Unsupported webhook job status: {status}")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT refresh_wiki, refresh_bash
+                FROM webhook_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            pending = bool(row[0]) or bool(row[1])
+            next_status = "pending" if pending or retryable else status
+            connection.execute(
+                """
+                UPDATE webhook_jobs
+                SET status = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_status, last_error, datetime.now(UTC).isoformat(), job_id),
+            )
+            return pending
+
+    def get_automation_run(self, run_key: str) -> AutomationRun | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_key, package, version, report_id, status,
+                       pr_url, notification_sent, last_error, updated_at
+                FROM automation_runs
+                WHERE run_key = ?
+                """,
+                (run_key,),
+            ).fetchone()
+        return self._automation_run(row)
+
+    def save_automation_run(
+        self,
+        *,
+        run_key: str,
+        package: str,
+        version: str,
+        report_id: int | None,
+        status: str,
+        pr_url: str | None = None,
+        notification_sent: bool = False,
+        last_error: str | None = None,
+    ) -> AutomationRun:
+        """Persist an idempotent record of automatic PR/notification work."""
+        updated_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO automation_runs (
+                    run_key, package, version, report_id, status,
+                    pr_url, notification_sent, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_key) DO UPDATE SET
+                    report_id = excluded.report_id,
+                    status = excluded.status,
+                    pr_url = COALESCE(excluded.pr_url, automation_runs.pr_url),
+                    notification_sent = (
+                        automation_runs.notification_sent OR excluded.notification_sent
+                    ),
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    run_key,
+                    package,
+                    version,
+                    report_id,
+                    status,
+                    pr_url,
+                    notification_sent,
+                    last_error,
+                    updated_at,
+                ),
+            )
+        result = self.get_automation_run(run_key)
+        if result is None:
+            raise RuntimeError("Automation run could not be reloaded")
+        return result
+
     @staticmethod
     def _stored_comparison_report(
         row: sqlite3.Row | tuple[object, object, object] | None,
@@ -397,6 +677,38 @@ class ParsedSourceRepository:
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _webhook_job(row: sqlite3.Row | None) -> WebhookJob | None:
+        if row is None:
+            return None
+        return WebhookJob(
+            job_id=int(row[0]),
+            package=str(row[1]),
+            version=row[2],
+            refresh_wiki=bool(row[3]),
+            refresh_bash=bool(row[4]),
+            status=str(row[5]),
+            attempts=int(row[6]),
+            last_error=row[7],
+            updated_at=str(row[8]),
+        )
+
+    @staticmethod
+    def _automation_run(row: sqlite3.Row | None) -> AutomationRun | None:
+        if row is None:
+            return None
+        return AutomationRun(
+            run_key=str(row[0]),
+            package=str(row[1]),
+            version=str(row[2]),
+            report_id=int(row[3]) if row[3] is not None else None,
+            status=str(row[4]),
+            pr_url=row[5],
+            notification_sent=bool(row[6]),
+            last_error=row[7],
+            updated_at=str(row[8]),
+        )
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -448,6 +760,42 @@ class ParsedSourceRepository:
                         script_repository, script_path, script_ref, script_revision,
                         wiki_parser_version, bash_parser_version, analysis_version
                     )
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS webhook_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    package TEXT NOT NULL,
+                    version TEXT,
+                    refresh_wiki INTEGER NOT NULL DEFAULT 0,
+                    refresh_bash INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_webhook_jobs_active
+                ON webhook_jobs(package, version, status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS automation_runs (
+                    run_key TEXT PRIMARY KEY,
+                    package TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    report_id INTEGER,
+                    status TEXT NOT NULL,
+                    pr_url TEXT,
+                    notification_sent INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )

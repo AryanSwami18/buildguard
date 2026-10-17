@@ -15,6 +15,7 @@ class BashParser:
     def parse(self, script: str) -> BashScript:
         """Parse a script into a small, JSON-friendly view of the bashlex AST."""
         parser_source, conditional_tests = _mask_double_bracket_tests(script)
+        parser_source = _mask_quoted_heredoc_delimiters(parser_source)
         parser_source = _mask_arithmetic_expansions(parser_source)
         parser_source = _mask_case_dispatch(parser_source)
         return BashScript(
@@ -78,6 +79,106 @@ _CONTROL_CONDITION = re.compile(r"^\s*(?:if|elif|while|until)\b")
 _DOUBLE_BRACKET_TEST = re.compile(r"\[\[.*?\]\]")
 _ARITHMETIC_EXPANSION = re.compile(r"\$\(\(.*?\)\)")
 _CASE_START = re.compile(r"^\s*case\b")
+
+
+def _mask_quoted_heredoc_delimiters(source: str) -> str:
+    """Make quoted heredoc delimiters acceptable to bashlex.
+
+    Bash permits all of these forms and removes the quotes from the delimiter
+    before matching the closing line::
+
+        cat <<'EOF'
+        cat <<"EOF"
+        cat <<-'EOF'
+
+    bashlex currently treats the quote characters as part of the delimiter and
+    raises ``ParsingError`` even when the Bash source is valid. Replace only
+    the opening and closing quote characters with spaces. This keeps the
+    parser source exactly the same length, so every AST position still points
+    into the original script supplied to callers.
+
+    This is deliberately a lexical transformation rather than a general
+    heredoc parser: the heredoc body is left untouched and real malformed
+    heredocs still raise a parsing error instead of being silently ignored.
+    """
+    characters = list(source)
+    index = 0
+    quote: str | None = None
+    escaped = False
+
+    while index < len(source):
+        character = source[index]
+
+        if quote is not None:
+            if quote == "'":
+                if character == quote:
+                    quote = None
+            elif escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+
+        if character == "\\":
+            index += 2
+            continue
+
+        # A heredoc opener in a shell comment is not syntax. Skipping the rest
+        # of the line also prevents quotes in comments from changing the
+        # lexical state used by this small scanner.
+        if character == "#" and (
+            index == 0 or source[index - 1].isspace()
+        ):
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+
+        if source.startswith("<<", index):
+            delimiter_start = index + 2
+            if delimiter_start < len(source) and source[delimiter_start] == "-":
+                delimiter_start += 1
+            while (
+                delimiter_start < len(source)
+                and source[delimiter_start] in " \t"
+            ):
+                delimiter_start += 1
+
+            if delimiter_start < len(source) and source[delimiter_start] in "'\"":
+                delimiter_quote = source[delimiter_start]
+                delimiter_end = delimiter_start + 1
+                escaped_delimiter_character = False
+                while delimiter_end < len(source):
+                    delimiter_character = source[delimiter_end]
+                    if escaped_delimiter_character:
+                        escaped_delimiter_character = False
+                    elif delimiter_character == "\\":
+                        escaped_delimiter_character = True
+                    elif delimiter_character == delimiter_quote:
+                        break
+                    elif delimiter_character == "\n":
+                        break
+                    delimiter_end += 1
+
+                if (
+                    delimiter_end < len(source)
+                    and source[delimiter_end] == delimiter_quote
+                ):
+                    characters[delimiter_start] = " "
+                    characters[delimiter_end] = " "
+                    index = delimiter_end + 1
+                    continue
+
+        index += 1
+
+    return "".join(characters)
 
 
 def _mask_double_bracket_tests(source: str) -> tuple[str, set[int]]:

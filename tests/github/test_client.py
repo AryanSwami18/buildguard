@@ -3,12 +3,12 @@ import json
 from pathlib import Path
 import subprocess
 
-from app.github.client import GitHubClient
+from app.github.client import GitHubClient, GitHubResourceNotFound
 from app.config.settings import Settings
 from app.intelligence.request import LLMRequest
 from app.intelligence.response import LLMResponse
 from app.pipeline.build_pipeline import BuildPipeline
-from app.sources.github import GitHubFile
+from app.sources.github import GitHubDirectoryEntry, GitHubFile
 
 
 class FakeResponse:
@@ -28,7 +28,7 @@ class FakeResponse:
 def mock_github_responses(monkeypatch, responses: dict[str, object]) -> list[str]:
     requested_urls: list[str] = []
 
-    def fake_urlopen(request):
+    def fake_urlopen(request, **kwargs):
         requested_urls.append(request.full_url)
         return FakeResponse(responses[request.full_url])
 
@@ -175,6 +175,47 @@ def test_client_lists_building_wiki_modules(monkeypatch) -> None:
     client = GitHubClient(repository="example/docs")
 
     assert client.list_wiki_modules() == ["Building-Alfresco", "Building-Share"]
+
+
+def test_client_resolves_case_and_separator_difference_in_script_directory(
+    monkeypatch,
+) -> None:
+    directory = GitHubDirectoryEntry(
+        repository="example/scripts",
+        ref="master",
+        path="ApacheHttpServer",
+        filename="ApacheHttpServer",
+        github_url="https://github.com/example/scripts/tree/master/ApacheHttpServer",
+        kind="directory",
+    )
+    script = GitHubDirectoryEntry(
+        repository="example/scripts",
+        ref="master",
+        path="ApacheHttpServer/2.4.68/build_apachehttpserver.sh",
+        filename="build_apachehttpserver.sh",
+        github_url="https://github.com/example/scripts/blob/master/ApacheHttpServer/2.4.68/build_apachehttpserver.sh",
+        kind="file",
+    )
+
+    def fake_list_path(_self, repository, path, ref):
+        if path == "Apache-HTTP-Server/2.4.68":
+            raise GitHubResourceNotFound("missing alias path")
+        if path == "":
+            return [directory]
+        assert path == "ApacheHttpServer/2.4.68"
+        return [script]
+
+    monkeypatch.setattr(GitHubClient, "list_path", fake_list_path)
+    client = GitHubClient()
+
+    selected = client._select_build_script(
+        "example/scripts",
+        "Apache-HTTP-Server",
+        "2.4.68",
+        "master",
+    )
+
+    assert selected.path == "ApacheHttpServer/2.4.68/build_apachehttpserver.sh"
 
 
 def test_client_creates_file_pull_request_from_current_base(monkeypatch) -> None:

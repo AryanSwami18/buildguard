@@ -13,11 +13,16 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from app.config.settings import Settings
+from app.package_mapping import normalize_package_name
 from app.sources.github import GitHubDirectoryEntry, GitHubFile, GitHubWikiPage
 
 GITHUB_REQUEST_TIMEOUT_SECONDS = 30
 WIKI_CLONE_TIMEOUT_SECONDS = 60
 WIKI_REVISION_TIMEOUT_SECONDS = 30
+
+
+class GitHubResourceNotFound(RuntimeError):
+    """A requested GitHub file, directory, or Wiki page does not exist."""
 
 
 class GitHubClient:
@@ -263,6 +268,7 @@ class GitHubClient:
         title: str,
         body: str,
         draft: bool = True,
+        branch_name: str | None = None,
     ) -> dict[str, Any]:
         """Create a branch, commit one file, and open a pull request.
 
@@ -280,6 +286,19 @@ class GitHubClient:
             raise ValueError("The proposed script has no changes")
 
         head_repository = head_repository or repository
+        branch = branch_name or self._fix_branch_name(path)
+        if branch_name:
+            existing = self.find_open_pull_request(
+                repository=repository,
+                head_repository=head_repository,
+                branch=branch,
+                base_branch=base_branch,
+            )
+            if existing is not None:
+                existing["head_repository"] = head_repository
+                existing["branch"] = branch
+                return existing
+
         base_file = self.fetch_file(repository, path, base_branch)
         if base_file.content != original_content:
             raise RuntimeError(
@@ -297,7 +316,6 @@ class GitHubClient:
         except (KeyError, TypeError) as error:
             raise RuntimeError("GitHub did not return the base branch commit SHA") from error
 
-        branch = self._fix_branch_name(path)
         self._request_json(
             "POST",
             self._git_refs_url(head_repository),
@@ -337,6 +355,29 @@ class GitHubClient:
         pull_request["branch"] = branch
         return pull_request
 
+    def find_open_pull_request(
+        self,
+        *,
+        repository: str,
+        head_repository: str,
+        branch: str,
+        base_branch: str,
+    ) -> dict[str, Any] | None:
+        """Find an existing open PR for a deterministic automation branch."""
+        head = f"{head_repository.split('/', 1)[0]}:{branch}"
+        url = (
+            f"{self._pulls_url(repository)}?state=open"
+            f"&base={quote(base_branch, safe='')}"
+            f"&head={quote(head, safe='')}"
+        )
+        payload = self._get_json(url)
+        if not isinstance(payload, list):
+            return None
+        for item in payload:
+            if isinstance(item, dict):
+                return item
+        return None
+
     def _get_json(self, url: str) -> Any:
         return self._request_json("GET", url)
 
@@ -365,6 +406,10 @@ class GitHubClient:
                 f"GitHub request timed out after {GITHUB_REQUEST_TIMEOUT_SECONDS} seconds"
             ) from error
         except Exception as error:
+            if getattr(error, "code", None) == 404:
+                raise GitHubResourceNotFound(
+                    f"GitHub resource was not found: {url}"
+                ) from error
             detail = getattr(error, "read", lambda: b"")()
             if isinstance(detail, bytes):
                 detail = detail.decode("utf-8", errors="replace")
@@ -462,6 +507,7 @@ class GitHubClient:
         product: str,
         version: str,
         ref: str | None = None,
+        script_filename: str | None = None,
     ) -> GitHubFile:
         """Find and fetch the build shell script for a product/version."""
         selected = self._select_build_script(
@@ -469,6 +515,7 @@ class GitHubClient:
             product,
             version,
             ref,
+            script_filename,
         )
         resolved_ref = self._resolve_ref(ref)
         return self.fetch_file(repository, selected.path, resolved_ref)
@@ -479,10 +526,17 @@ class GitHubClient:
         product: str,
         version: str,
         ref: str | None = None,
+        script_filename: str | None = None,
     ) -> tuple[str, str | None]:
         """Find a build script and return its path plus its GitHub blob SHA."""
         resolved_ref = self._resolve_ref(ref)
-        selected = self._select_build_script(repository, product, version, ref)
+        selected = self._select_build_script(
+            repository,
+            product,
+            version,
+            ref,
+            script_filename,
+        )
         metadata = self._get_json(
             self._contents_url(repository, selected.path, resolved_ref)
         )
@@ -499,6 +553,7 @@ class GitHubClient:
         product: str,
         version: str,
         ref: str | None,
+        script_filename: str | None = None,
     ) -> GitHubDirectoryEntry:
         resolved_ref = self._resolve_ref(ref)
         product_path = product.strip().strip("/")
@@ -506,7 +561,18 @@ class GitHubClient:
             raise ValueError("Script product name cannot be empty")
 
         version_path = f"{product_path}/{version}"
-        entries = self.list_path(repository, version_path, resolved_ref)
+        try:
+            entries = self.list_path(repository, version_path, resolved_ref)
+        except GitHubResourceNotFound as original_error:
+            product_path = self._find_normalized_product_path(
+                repository,
+                product_path,
+                resolved_ref,
+            )
+            if product_path is None:
+                raise original_error
+            version_path = f"{product_path}/{version}"
+            entries = self.list_path(repository, version_path, resolved_ref)
         shell_files = [
             entry
             for entry in entries
@@ -516,6 +582,20 @@ class GitHubClient:
         if not shell_files:
             raise ValueError(
                 f"No shell script found in {repository}/{version_path}"
+            )
+
+        if script_filename:
+            matching = [
+                entry
+                for entry in shell_files
+                if entry.filename.casefold() == script_filename.casefold()
+            ]
+            if len(matching) == 1:
+                return matching[0]
+            names = ", ".join(entry.filename for entry in shell_files)
+            raise ValueError(
+                f"Script '{script_filename}' was not found in "
+                f"{repository}/{version_path}; available scripts: {names}"
             )
 
         expected_name = f"build_{PurePosixPath(product_path).name.lower()}.sh"
@@ -533,3 +613,22 @@ class GitHubClient:
                 f"Multiple shell scripts found in {repository}/{version_path}: {names}"
             )
         return selected
+
+    def _find_normalized_product_path(
+        self,
+        repository: str,
+        product: str,
+        ref: str,
+    ) -> str | None:
+        """Find a package directory differing only by case or separators."""
+        entries = self.list_path(repository, "", ref)
+        candidates = [
+            entry.path
+            for entry in entries
+            if entry.kind == "directory"
+            and normalize_package_name(entry.filename)
+            == normalize_package_name(product)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None

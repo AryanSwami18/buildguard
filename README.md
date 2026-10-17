@@ -125,7 +125,39 @@ The API listens on `127.0.0.1:8080` and the UI on `127.0.0.1:8501`. Expose
 for the scripts repository and the **Wiki** event for the documentation
 repository. The backend recognizes changed `Building-*.md` pages and versioned
 `.sh` build scripts, then refreshes only the affected package's parsed cache in
-the background. `GET /healthz` is available for a service health check.
+the background. It also stores durable package/version jobs: a new Wiki version
+waits for its matching script, and a new script waits for its matching Wiki.
+Once both are available, BuildGuard saves the comparison report, optionally
+creates a deterministic draft PR, and optionally sends an email notification
+for every completed comparison, including clean reports with no findings.
+Duplicate deliveries and events received while a job is running are merged
+instead of creating duplicate work. `GET /healthz` is available for a service
+health check.
+
+Automatic PR creation is enabled by default for webhook jobs. Set
+`BUILDGUARD_AUTO_PR=false` to disable it. Email notifications use SMTP and are
+enabled when `BUILDGUARD_NOTIFICATION_EMAIL_TO` is set. Configure
+`BUILDGUARD_SMTP_HOST`, `BUILDGUARD_SMTP_PORT`, `BUILDGUARD_SMTP_USERNAME`,
+`BUILDGUARD_SMTP_PASSWORD`, `BUILDGUARD_SMTP_FROM`, and optionally
+`BUILDGUARD_SMTP_USE_TLS=false`. A failed PR or email action does not remove a
+completed report; the durable automation state records the failure for retry.
+
+Wiki and script package names are resolved through the built-in package map.
+New packages with the same name, different capitalization, or different
+separators are discovered automatically. For a genuinely different or
+ambiguous name, add an alias without changing code:
+
+```dotenv
+BUILDGUARD_PACKAGE_ALIASES='{"Wiki-Package":{"directory":"ScriptsDirectory","filename":"build.sh"}}'
+```
+
+The `filename` property is optional. It should be provided when a version
+directory contains more than one shell script.
+
+When `NGROK_DOMAIN` is set, `run_buildguard.sh` also starts ngrok and forwards
+the API/webhook port to that fixed domain. Configure GitHub with
+`https://<NGROK_DOMAIN>/github/webhook`. The ngrok agent must be installed and
+authenticated on the machine.
 
 The Streamlit UI communicates with the backend through `BUILDGUARD_API_URL`.
 The API uses `GITHUB_WEBHOOK_SECRET` as an internal API key when it is set, so

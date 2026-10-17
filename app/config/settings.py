@@ -105,6 +105,44 @@ class Settings:
         )
     )
 
+    buildguard_auto_pr: bool = field(
+        default_factory=lambda: os.getenv(
+            "BUILDGUARD_AUTO_PR",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+    notification_email_to: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_NOTIFICATION_EMAIL_TO") or None
+    )
+
+    smtp_host: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_SMTP_HOST") or None
+    )
+
+    smtp_port: int = field(
+        default_factory=lambda: int(os.getenv("BUILDGUARD_SMTP_PORT", "587"))
+    )
+
+    smtp_username: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_SMTP_USERNAME") or None
+    )
+
+    smtp_password: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_SMTP_PASSWORD") or None
+    )
+
+    smtp_from: str | None = field(
+        default_factory=lambda: os.getenv("BUILDGUARD_SMTP_FROM") or None
+    )
+
+    smtp_use_tls: bool = field(
+        default_factory=lambda: os.getenv(
+            "BUILDGUARD_SMTP_USE_TLS",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    )
+
     github_webhook_secret: str | None = field(
         default_factory=lambda: os.getenv("GITHUB_WEBHOOK_SECRET")
     )

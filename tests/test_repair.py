@@ -4,16 +4,19 @@ import pytest
 
 from app.intelligence.request import LLMRequest
 from app.intelligence.response import LLMResponse
+from app.config.settings import Settings
 from app.models.report import (
     ComparisonCounts,
     ComparisonReport,
     Discrepancy,
+    ReportSource,
     StepEvidence,
 )
 from app.models.step import ActionType
 from app.models.repair import ScriptFixProposal
 from app.models.validation import DiscrepancyCategory, MatchStatus
 from app.repair import generate_script_fix_proposal
+from app.service import _build_pull_request_body
 
 
 def _report() -> ComparisonReport:
@@ -169,3 +172,61 @@ def test_ai_fix_rejects_unrelated_indentation_or_eof_changes() -> None:
             report,
             "#!/usr/bin/env bash\necho original\n",
         )
+
+
+def test_generated_pr_body_explains_the_change_and_supporting_evidence() -> None:
+    report = _report()
+    report.overview = "The script has one action that is not represented in the Wiki."
+    report.wiki_source = ReportSource(
+        name="Build Instructions",
+        repository="example/docs",
+        ref="main",
+        path="Building-Bazel.md",
+        url="https://github.com/example/docs/blob/main/Building-Bazel.md",
+    )
+    report.script_source = ReportSource(
+        name="build_bazel.sh",
+        repository="example/scripts",
+        ref="master",
+        path="Bazel/9.2.0/build_bazel.sh",
+        url="https://github.com/example/scripts/blob/master/Bazel/9.2.0/build_bazel.sh",
+    )
+    report.discrepancies[0].wiki = StepEvidence(
+        id="wiki-1",
+        description="Install Bazel dependencies.",
+        action=ActionType.INSTALL_PACKAGE,
+        location="Building-Bazel.md | line 20",
+        line_start=20,
+        line_end=20,
+        commands=["sudo apt-get install -y build-essential"],
+    )
+
+    proposal = ScriptFixProposal(
+        fixed_script="#!/usr/bin/env bash\necho fixed\n",
+        summary="Replace the untracked command with the documented dependency install.",
+        rationale="The Wiki documents the dependency installation, so the script should use it.",
+        affected_finding_ids=["D-001"],
+    )
+    body = _build_pull_request_body(
+        report,
+        proposal,
+        report.script_source,
+        Settings(scripts_repo="example/scripts", scripts_branch="master"),
+    )
+
+    assert "## Summary" in body
+    assert "Bazel" in body and "9.2.0" in body
+    assert "## Why this change is needed" in body
+    assert "## What the proposed change does" in body
+    assert proposal.summary in body
+    assert proposal.rationale in body
+    assert "### Problem 1: The script performs an undocumented build action" in body
+    assert "D-001" not in body
+    assert "wiki-1" not in body
+    assert "Wiki step" not in body
+    assert "Bash step" not in body
+    assert "Install Bazel dependencies." in body
+    assert "sudo apt-get install -y build-essential" in body
+    assert "## Sources" in body
+    assert "https://github.com/example/docs/blob/main/Building-Bazel.md" in body
+    assert "## Reviewer checklist" in body

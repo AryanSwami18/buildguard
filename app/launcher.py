@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,40 +23,67 @@ def main() -> int:
     ui_host = os.getenv("STREAMLIT_HOST", "127.0.0.1")
     ui_port = int(os.getenv("STREAMLIT_PORT", "8501"))
     api_url = os.getenv("BUILDGUARD_API_URL", f"http://127.0.0.1:{api_port}")
+    ngrok_domain = os.getenv("NGROK_DOMAIN", "").strip()
+    ngrok_binary = os.getenv("NGROK_BIN", "ngrok").strip() or "ngrok"
+
+    ngrok_url = ""
+    if ngrok_domain:
+        ngrok_url = (
+            ngrok_domain
+            if ngrok_domain.startswith(("http://", "https://"))
+            else f"https://{ngrok_domain}"
+        )
+        ngrok_path = shutil.which(ngrok_binary)
+        if ngrok_path is None:
+            raise SystemExit(
+                f"NGROK_DOMAIN is configured, but '{ngrok_binary}' was not found. "
+                "Install ngrok or set NGROK_BIN to its executable path."
+            )
 
     environment = os.environ.copy()
     environment["BUILDGUARD_API_URL"] = api_url
 
+    process_commands = [
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.api:app",
+            "--host",
+            api_host,
+            "--port",
+            str(api_port),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(PROJECT_ROOT / "streamlit_app.py"),
+            "--server.address",
+            ui_host,
+            "--server.port",
+            str(ui_port),
+        ],
+    ]
+    if ngrok_url:
+        process_commands.append(
+            [
+                ngrok_path,
+                "http",
+                str(api_port),
+                "--url",
+                ngrok_url,
+            ]
+        )
+
     processes = [
         subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "app.api:app",
-                "--host",
-                api_host,
-                "--port",
-                str(api_port),
-            ],
+            command,
             cwd=PROJECT_ROOT,
             env=environment,
-        ),
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "streamlit",
-                "run",
-                str(PROJECT_ROOT / "streamlit_app.py"),
-                "--server.address",
-                ui_host,
-                "--server.port",
-                str(ui_port),
-            ],
-            cwd=PROJECT_ROOT,
-            env=environment,
-        ),
+        )
+        for command in process_commands
     ]
 
     stopping = False
