@@ -20,6 +20,7 @@ from app.models.repair import ScriptFixProposal
 from app.models.report import ComparisonReport
 from app.parsers.bash_semantic_parser import parse_bash_steps
 from app.parsers.version_parser import extract_version, product_from_module
+from app.parsers.wiki_semantic_parser import complete_wiki_instruction
 from app.package_mapping import canonical_wiki_package, script_target_for_package
 from app.pipeline.build_pipeline import BuildPipeline
 from app.reporting.reporter import build_comparison_report
@@ -35,8 +36,8 @@ from app.notifications import send_report_notification
 ProgressCallback = Callable[[str], None]
 
 WIKI_PARSER_VERSION = "wiki-buildsteps-v1"
-BASH_PARSER_VERSION = "bash-semantic-v3"
-COMPARISON_ANALYSIS_VERSION = "comparison-v1"
+BASH_PARSER_VERSION = "bash-semantic-v4"
+COMPARISON_ANALYSIS_VERSION = "comparison-v12-duplicate-aware-ownership"
 
 
 class SourcePending(RuntimeError):
@@ -107,9 +108,16 @@ def run_package_comparison(
     package: str,
     settings: Settings,
     progress: ProgressCallback | None = None,
+    *,
+    force_comparison: bool = False,
 ) -> ComparisonReport:
     """Fetch, parse, and compare one package's documentation and script."""
-    return _run_package_comparison(package, settings, progress).report
+    return _run_package_comparison(
+        package,
+        settings,
+        progress,
+        bypass_report_cache=force_comparison,
+    ).report
 
 
 def _run_package_comparison(
@@ -119,6 +127,7 @@ def _run_package_comparison(
     *,
     force_wiki: bool = False,
     force_bash: bool = False,
+    bypass_report_cache: bool = False,
     version_hint: str | None = None,
 ) -> ComparisonRun:
     """Run one comparison, optionally targeting a script version from a webhook."""
@@ -201,17 +210,27 @@ def _run_package_comparison(
         package=product,
         version=version,
     )
-    if cache_key is not None:
+    if cache_key is not None and not bypass_report_cache:
         notify("Checking for a saved comparison report...")
         cached_report = cache.get_comparison_report(cache_key)
+        if cached_report is None:
+            cached_report = cache.get_latest_comparison_report_for_sources(cache_key)
         if cached_report is not None:
-            notify("Using the saved comparison report; no source changes were found.")
+            notify(
+                "Using the saved comparison report; the Wiki and script revisions "
+                "are unchanged. Choose Compare again to run a fresh analysis."
+            )
             return ComparisonRun(
                 report=cached_report.report,
                 cache_key=cache_key,
                 stored_report=cached_report,
                 reused=True,
             )
+    elif bypass_report_cache:
+        notify(
+            "Skipping the saved-report cache; reusing current parsed sources "
+            "and running a fresh comparison..."
+        )
 
     notify("Comparing Wiki instructions with the build script using AI...")
     comparison = pipeline.compare(wiki_instruction, bash_instruction)
@@ -320,6 +339,28 @@ def _comparison_run_key(key: ComparisonCacheKey) -> str:
     ).hexdigest()
 
 
+def _automation_run_key(
+    key: ComparisonCacheKey,
+    trigger_id: str | None = None,
+) -> str:
+    """Create a notification key for one source comparison trigger.
+
+    The comparison cache is intentionally keyed by source content. A merged
+    PR can restore a file blob that was seen before, but it is still a new
+    GitHub event that must be compared and notified independently.
+    """
+    comparison_key = _comparison_run_key(key)
+    if not trigger_id:
+        return comparison_key
+    return hashlib.sha256(
+        json.dumps(
+            {"comparison": comparison_key, "trigger": trigger_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def run_automated_package_review(
     package: str,
     settings: Settings,
@@ -328,6 +369,8 @@ def run_automated_package_review(
     version: str | None = None,
     refresh_wiki: bool = False,
     refresh_bash: bool = False,
+    trigger_id: str | None = None,
+    force_comparison: bool = False,
 ) -> AutomationOutcome:
     """Process a webhook target through comparison, PR, and notification."""
     notify = progress or (lambda _message: None)
@@ -341,6 +384,7 @@ def run_automated_package_review(
             # must not bypass revision checks on duplicate webhook deliveries.
             force_wiki=False,
             force_bash=False,
+            bypass_report_cache=force_comparison,
             version_hint=version,
         )
     except ValueError as error:
@@ -363,7 +407,7 @@ def run_automated_package_review(
         )
 
     cache = ParsedSourceRepository(settings.buildguard_database_path)
-    run_key = _comparison_run_key(run.cache_key)
+    run_key = _automation_run_key(run.cache_key, trigger_id)
     previous = cache.get_automation_run(run_key)
     report_id = run.stored_report.report_id if run.stored_report else None
 
@@ -429,7 +473,21 @@ def run_automated_package_review(
         )
 
     notification_sent = previous.notification_sent if previous is not None else False
-    if settings.notification_email_to and not notification_sent:
+    # An actionable automated report is useful to the repository owner only
+    # when it includes the PR that needs review. If PR creation failed, keep
+    # the run retryable and do not send a misleading email without a link.
+    # Clean reports and manually managed runs retain their normal notification
+    # behavior.
+    notification_ready = (
+        not report.discrepancies
+        or not settings.buildguard_auto_pr
+        or bool(pr_url)
+    )
+    if (
+        settings.notification_email_to
+        and not notification_sent
+        and notification_ready
+    ):
         try:
             notify("Sending the BuildGuard report notification...")
             send_report_notification(
@@ -462,6 +520,15 @@ def run_automated_package_review(
                 last_error=action_error,
             )
             notify(f"Report notification could not be sent: {notification_error}")
+    elif (
+        settings.notification_email_to
+        and not notification_sent
+        and not notification_ready
+    ):
+        notify(
+            "Actionable findings remain, but the automatic PR was not created; "
+            "notification deferred until a PR link is available."
+        )
 
     return AutomationOutcome(
         "followup_failed" if action_error else "complete",
@@ -477,7 +544,12 @@ def _automation_branch_name(report: ComparisonReport, run_key: str) -> str:
     return f"buildguard/auto/{safe_package}-{safe_version}-{run_key[:12]}"
 
 
-def start_package_comparison(package: str, settings: Settings) -> str:
+def start_package_comparison(
+    package: str,
+    settings: Settings,
+    *,
+    force_comparison: bool = False,
+) -> str:
     """Start a comparison job and return its ID for progress polling."""
     job_id = uuid4().hex
     job = _ComparisonJob()
@@ -500,6 +572,7 @@ def start_package_comparison(package: str, settings: Settings) -> str:
         package,
         settings,
         notify,
+        force_comparison=force_comparison,
     )
     return job_id
 
@@ -1022,8 +1095,31 @@ def _load_wiki_instruction(
             and cached[1] == remote_revision
             and cached[0].version is not None
         ):
+            cached_content = cache.get_source_content(
+                source_kind="wiki",
+                repository=settings.github_repo,
+                path=path,
+                ref=settings.github_branch,
+                parser_version=parser_version,
+            )
+            cached_instruction = (
+                complete_wiki_instruction(cached[0], cached_content, module)
+                if cached_content is not None
+                else cached[0]
+            )
+            if cached_content is not None and cached_instruction.model_dump() != cached[0].model_dump():
+                cache.save_instruction(
+                    source_kind="wiki",
+                    repository=settings.github_repo,
+                    path=path,
+                    ref=settings.github_branch,
+                    parser_version=parser_version,
+                    remote_revision=cached[1],
+                    content=cached_content,
+                    instruction=cached_instruction,
+                )
             notify(f"Using cached parsed Wiki instructions for '{module}'.")
-            return cached[0]
+            return cached_instruction
 
     notify(f"Fetching Wiki module '{module}'...")
     try:
@@ -1058,7 +1154,23 @@ def _load_wiki_instruction(
             parser_version=parser_version,
             content=page.content,
         )
-        return cached[0]
+        cached_instruction = complete_wiki_instruction(
+            cached[0],
+            page.content,
+            module,
+        )
+        if cached_instruction.model_dump() != cached[0].model_dump():
+            cache.save_instruction(
+                source_kind="wiki",
+                repository=settings.github_repo,
+                path=page.path,
+                ref=settings.github_branch,
+                parser_version=parser_version,
+                remote_revision=cached[1],
+                content=page.content,
+                instruction=cached_instruction,
+            )
+        return cached_instruction
 
     version = extract_version(page.content, product)
     if version is None:

@@ -266,3 +266,54 @@ def test_client_creates_file_pull_request_from_current_base(monkeypatch) -> None
     assert requests[0][2]["sha"] == "base-sha"
     assert requests[1][2]["sha"] == "file-sha"
     assert requests[1][2]["content"]
+
+
+def test_client_resolves_head_to_repository_default_branch_for_pull_request(
+    monkeypatch,
+) -> None:
+    client = GitHubClient(token="write-token")
+    requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_fetch_file(repository, path, ref):
+        assert repository == "example/scripts"
+        assert ref == "main"
+        return GitHubFile(
+            repository=repository,
+            ref=ref,
+            path=path,
+            filename="build.sh",
+            github_url="https://github.com/example/scripts/blob/main/build.sh",
+            content="echo original\n",
+            sha="file-sha",
+        )
+
+    def fake_get(url: str):
+        if url == "https://api.github.com/repos/example/scripts":
+            return {"default_branch": "main"}
+        assert url.endswith("/git/ref/heads/main")
+        return {"object": {"sha": "base-sha"}}
+
+    def fake_request(method: str, url: str, payload=None):
+        requests.append((method, url, payload))
+        if url.endswith("/pulls"):
+            return {"number": 8, "html_url": "https://github.com/example/scripts/pull/8"}
+        return {}
+
+    monkeypatch.setattr(client, "fetch_file", fake_fetch_file)
+    monkeypatch.setattr(client, "_get_json", fake_get)
+    monkeypatch.setattr(client, "_request_json", fake_request)
+
+    result = client.create_file_pull_request(
+        repository="example/scripts",
+        head_repository=None,
+        base_branch="HEAD",
+        path="ANTLR/4.13.2/build_antlr4.sh",
+        original_content="echo original\n",
+        fixed_content="echo fixed\n",
+        title="BuildGuard: fix ANTLR build script",
+        body="Generated fix.",
+    )
+
+    assert result["number"] == 8
+    assert requests[-1][2]["base"] == "main"
+    assert requests[0][2]["sha"] == "base-sha"

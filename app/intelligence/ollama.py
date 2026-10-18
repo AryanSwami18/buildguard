@@ -28,6 +28,7 @@ class OllamaProvider:
         self.context_tokens = context_tokens
 
     def generate(self, request: LLMRequest) -> LLMResponse:
+        output_tokens = request.max_output_tokens or self.max_output_tokens
         system_prompt = request.system_prompt
         if request.structured_output_instructions:
             system_prompt = (
@@ -52,7 +53,7 @@ class OllamaProvider:
             "options": {
                 "temperature": 0,
                 "num_ctx": self.context_tokens,
-                "num_predict": self.max_output_tokens,
+                "num_predict": output_tokens,
             },
         }
         raw_response = self._post(payload)
@@ -67,10 +68,15 @@ class OllamaProvider:
 
         if raw_response.get("done_reason") == "length":
             generated_tokens = raw_response.get("eval_count")
+            limit_hint = (
+                "increase the comparison output budget"
+                if request.max_output_tokens is not None
+                else "increase OLLAMA_MAX_OUTPUT_TOKENS"
+            )
             raise RuntimeError(
                 "Ollama response exceeded the output limit "
-                f"({self.max_output_tokens} tokens); increase "
-                f"OLLAMA_MAX_OUTPUT_TOKENS. Ollama generated {generated_tokens} tokens."
+                f"({output_tokens} tokens); {limit_hint}. "
+                f"Ollama generated {generated_tokens} tokens."
             )
 
         try:

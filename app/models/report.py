@@ -1,6 +1,8 @@
 """Structured, mismatch-only comparison report models."""
 
-from pydantic import BaseModel, Field
+import re
+
+from pydantic import BaseModel, Field, field_validator
 
 from .step import ActionType
 from .validation import DiscrepancyCategory, MatchStatus
@@ -29,7 +31,7 @@ class ComparisonCounts(BaseModel):
     true_documentation_gaps: int = 0
     potential_conflicts: int = 0
     unused_configuration: int = 0
-    implementation_details_ignored: int = 0
+    implementation_details_ignored: int = Field(default=0, exclude=True)
 
 
 class StepEvidence(BaseModel):
@@ -78,3 +80,19 @@ class ComparisonReport(BaseModel):
     wiki_source: ReportSource | None = None
     script_source: ReportSource | None = None
     discrepancies: list[Discrepancy] = Field(default_factory=list)
+
+    @field_validator("overview")
+    @classmethod
+    def remove_legacy_implementation_detail_summary(cls, value: str) -> str:
+        """Keep cached reports readable after removing the old ignored-details KPI."""
+        value = value.replace(
+            "; implementation details were not treated as findings.", "."
+        )
+        return re.sub(
+            r"All (\d+) documented Wiki build actions matched the script or were "
+            r"represented by harmless implementation details\. No actionable "
+            r"differences were found\.",
+            r"All \1 documented Wiki build actions matched the script. No actionable "
+            r"differences were found.",
+            value,
+        )

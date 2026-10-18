@@ -1,4 +1,8 @@
-from app.matching.semantic_matcher import normalize_command, normalize_validation_result
+from app.matching.semantic_matcher import (
+    _group_conflicts,
+    normalize_command,
+    normalize_validation_result,
+)
 from app.models.build import BuildInstruction
 from app.models.context import SourceContext
 from app.models.step import ActionType, BuildStep
@@ -127,8 +131,15 @@ def test_grouped_java_workflow_is_not_reported_as_many_script_extras() -> None:
         bash,
     )
 
-    assert [match.status for match in result.matches] == [MatchStatus.MATCHED]
-    assert len(result.matches[0].automation_steps) == len(script_steps)
+    actionable = [
+        match for match in result.matches
+        if match.status != MatchStatus.IMPLEMENTATION_DETAIL
+    ]
+    assert [match.status for match in actionable] == [MatchStatus.MATCHED]
+    grouped_actions = {step.action for step in result.matches[0].automation_steps}
+    assert ActionType.DOWNLOAD in grouped_actions
+    assert ActionType.EXTRACT in grouped_actions
+    assert ActionType.CONFIGURE in grouped_actions
 
 
 def test_wiki_github_clone_url_groups_with_script_repository_workflow() -> None:
@@ -455,3 +466,163 @@ def test_concrete_version_disagreement_remains_a_conflict() -> None:
     )
 
     assert result.matches[0].status == MatchStatus.CONFLICT
+
+
+def test_version_conflict_ignores_unrelated_versions_in_grouped_script_steps() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.RUN_COMMAND,
+        "Download the Content App Docker Compose configuration",
+        commands=['export CONTENT_APP_VERSION="7.2.0"'],
+        version="7.2.0",
+    ).model_copy(update={"environment": {"CONTENT_APP_VERSION": "7.2.0"}})
+    unrelated_script_step = _step(
+        "bash-1",
+        ActionType.DOWNLOAD,
+        "Download ActiveMQ",
+        version="5.18.7",
+        component="activemq",
+    ).model_copy(update={"environment": {"ACTIVEMQ_VERSION": "5.18.7"}})
+
+    assert not _group_conflicts(wiki_step, [unrelated_script_step])
+
+
+def test_version_conflict_matches_same_named_version_configuration() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.RUN_COMMAND,
+        "Download the Content App Docker Compose configuration",
+        commands=['export CONTENT_APP_VERSION="7.2.0"'],
+        version="7.2.0",
+    ).model_copy(update={"environment": {"CONTENT_APP_VERSION": "7.2.0"}})
+    script_step = _step(
+        "bash-1",
+        ActionType.RUN_COMMAND,
+        "Download the Content App Docker Compose configuration",
+    ).model_copy(update={"environment": {"CONTENT_APP_VERSION": "7.1.0"}})
+
+    assert _group_conflicts(wiki_step, [script_step])
+
+
+def test_compose_revision_check_does_not_compare_an_unrelated_script_commit() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.RUN_COMMAND,
+        "Download Content App Docker Compose configuration",
+        commands=[
+            'export CONTENT_APP_VERSION="7.2.0"',
+            'wget "${ACS_DOCKER_COMPOSE_COMMIT}/community-compose.yaml"',
+        ],
+        version="7.2.0",
+    ).model_copy(
+        update={
+            "commit": "abc123",
+            "environment": {
+                "CONTENT_APP_VERSION": "7.2.0",
+                "ACS_DOCKER_COMPOSE_COMMIT": "abc123",
+            },
+        }
+    )
+    unrelated_script_step = _step(
+        "bash-1",
+        ActionType.DOWNLOAD,
+        "Download ActiveMQ",
+        version="5.18.7",
+        component="activemq",
+    ).model_copy(
+        update={
+            "commit": "def456",
+            "environment": {
+                "CONTENT_APP_VERSION": "7.2.0",
+                "ACS_DOCKER_COMPOSE_COMMIT": "abc123",
+                "ACTIVEMQ_VERSION": "5.18.7",
+            },
+        }
+    )
+
+    assert not _group_conflicts(wiki_step, [unrelated_script_step])
+    changed_compose_revision = unrelated_script_step.model_copy(
+        update={
+            "environment": {
+                **unrelated_script_step.environment,
+                "ACS_DOCKER_COMPOSE_COMMIT": "def456",
+            }
+        }
+    )
+    assert _group_conflicts(wiki_step, [changed_compose_revision])
+
+
+def test_versioned_dependency_difference_remains_a_conflict() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.INSTALL_PACKAGE,
+        "Install SLES runtime dependencies",
+        packages=["gcc13", "clang7", "make"],
+    )
+    script_step = _step(
+        "bash-1",
+        ActionType.INSTALL_PACKAGE,
+        "Install SLES runtime dependencies",
+        packages=["gcc13", "clang13", "make"],
+    )
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(
+                    wiki_step=wiki_step,
+                    status=MatchStatus.MISSING,
+                    explanation="missing",
+                ),
+                StepMatch(
+                    automation_step=script_step,
+                    status=MatchStatus.EXTRA,
+                    explanation="extra",
+                ),
+            ],
+            valid=False,
+            summary="",
+        ),
+        BuildInstruction(name="wiki", source="wiki", steps=[wiki_step]),
+        BuildInstruction(name="build.sh", source="bash", steps=[script_step]),
+    )
+
+    assert result.matches[0].status == MatchStatus.CONFLICT
+    assert result.matches[0].category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+    assert "clang7" in result.matches[0].explanation
+    assert "clang13" in result.matches[0].explanation
+
+
+def test_ai_matched_label_cannot_hide_versioned_dependency_conflict() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.INSTALL_PACKAGE,
+        "Install SLES runtime dependencies",
+        packages=["gcc13", "clang7", "make"],
+    )
+    script_step = _step(
+        "bash-1",
+        ActionType.INSTALL_PACKAGE,
+        "Install SLES runtime dependencies",
+        packages=["gcc13", "clang13", "make"],
+    )
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(
+                    wiki_step=wiki_step,
+                    automation_step=script_step,
+                    status=MatchStatus.MATCHED,
+                    explanation="AI says these match",
+                )
+            ],
+            valid=True,
+            summary="",
+        ),
+        BuildInstruction(name="wiki", source="wiki", steps=[wiki_step]),
+        BuildInstruction(name="build.sh", source="bash", steps=[script_step]),
+    )
+
+    assert result.matches[0].status == MatchStatus.CONFLICT
+    assert result.matches[0].category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+    assert "clang7" in result.matches[0].explanation
+    assert "clang13" in result.matches[0].explanation

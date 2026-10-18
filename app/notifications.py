@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 from html import escape
+import re
 import smtplib
 
 from app.config.settings import Settings
 from app.models.report import ComparisonReport
+from app.time_utils import local_timestamp
 
 
 def send_report_notification(
@@ -61,12 +63,15 @@ def _build_report_notification_message(
     """Build the email without opening an SMTP connection."""
     findings = report.discrepancies
     version = report.version or "unknown version"
+    sent_at = local_timestamp()
     subject_status = (
         "No issues found" if not findings else f"{len(findings)} item(s) need review"
     )
 
     message = EmailMessage()
-    message["Subject"] = f"BuildGuard · {report.package} {version} · {subject_status}"
+    message["Subject"] = (
+        f"BuildGuard · {report.package} {version} · {subject_status} · {sent_at}"
+    )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
     message.set_content(
@@ -89,6 +94,7 @@ def _plain_text_body(
     counts = report.counts
     lines = [
         f"BuildGuard review: {report.package} {report.version or 'unknown version'}",
+        f"Sent: {local_timestamp()}",
         "",
         "RESULT: No actionable findings were found."
         if not report.discrepancies
@@ -99,7 +105,6 @@ def _plain_text_body(
         f"- Wiki build actions reviewed: {counts.wiki_build_actions_analyzed or counts.wiki_steps_compared}",
         f"- Script build actions reviewed: {counts.script_build_actions_analyzed or counts.script_steps_checked}",
         f"- Semantic matches: {counts.semantic_matches}",
-        f"- Implementation details ignored: {counts.implementation_details_ignored}",
         f"- Actionable findings: {counts.findings}",
     ]
     if report.discrepancies:
@@ -110,6 +115,12 @@ def _plain_text_body(
                     f"\n{finding.id} · {_category_label(finding.category)}",
                     finding.title,
                     f"Why: {finding.explanation}",
+                    *_plain_evidence_lines("Wiki", finding.wiki),
+                    *[
+                        line
+                        for evidence in finding.script
+                        for line in _plain_evidence_lines("Script", evidence)
+                    ],
                     f"Recommended next step: {finding.recommendation}",
                 ]
             )
@@ -139,55 +150,53 @@ def _html_body(
     pr_url: str | None,
     action_error: str | None,
 ) -> str:
-    """Create a self-contained, email-client-friendly HTML summary."""
+    """Create a restrained, email-client-friendly engineering report."""
     counts = report.counts
     findings = report.discrepancies
     clean = not findings
-    accent = "#16a34a" if clean else "#dc2626"
-    accent_soft = "#f0fdf4" if clean else "#fef2f2"
-    result_label = (
-        "Review complete · no issues found"
-        if clean
-        else f"{len(findings)} item(s) need review"
-    )
+    accent = "#16794a" if clean else "#b42318"
+    result_label = "No actionable findings" if clean else f"{len(findings)} finding(s) need review"
     version = report.version or "unknown version"
 
-    stats = [
-        ("Actionable", counts.findings, "#dc2626" if counts.findings else "#16a34a"),
-        ("Semantic matches", counts.semantic_matches, "#2563eb"),
+    summary_rows = [
         (
-            "Wiki actions",
-            counts.wiki_build_actions_analyzed or counts.wiki_steps_compared,
-            "#475569",
+            "Actionable findings",
+            counts.findings,
+            accent if counts.findings else "#16794a",
         ),
-        ("Details ignored", counts.implementation_details_ignored, "#64748b"),
+        ("Semantic matches", counts.semantic_matches, "#1f2937"),
+        (
+            "Wiki build actions reviewed",
+            counts.wiki_build_actions_analyzed or counts.wiki_steps_compared,
+            "#1f2937",
+        ),
+        (
+            "Script build actions reviewed",
+            counts.script_build_actions_analyzed or counts.script_steps_checked,
+            "#1f2937",
+        ),
     ]
-    stats_html = "".join(
+    summary_html = "".join(
         f"""
-        <td style=\"width:25%;padding:0 4px 0 0;vertical-align:top;\">
-          <div style=\"border:1px solid #e2e8f0;border-radius:10px;padding:14px 12px;background:#ffffff;\">
-            <div style=\"font-size:25px;line-height:1;font-weight:700;color:{color};\">{value}</div>
-            <div style=\"padding-top:7px;font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:#64748b;\">{escape(label)}</div>
-          </div>
-        </td>
+        <tr>
+          <td style=\"padding:8px 0;border-bottom:1px solid #e5e7eb;font-size:13px;color:#4b5563;\">{escape(label)}</td>
+          <td align=\"right\" style=\"padding:8px 0;border-bottom:1px solid #e5e7eb;font-size:13px;font-weight:700;color:{color};\">{value}</td>
+        </tr>
         """
-        for label, value, color in stats
+        for label, value, color in summary_rows
     )
 
     if findings:
         finding_html = "".join(_finding_html(finding) for finding in findings)
         attention_section = f"""
-        <h2 style=\"margin:28px 0 12px;font-size:17px;color:#0f172a;\">What needs attention</h2>
+        <h2 style=\"margin:28px 0 10px;font-size:16px;color:#111827;\">Findings</h2>
         {finding_html}
         """
     else:
         attention_section = f"""
-        <div style=\"margin-top:24px;padding:16px 18px;border-radius:10px;background:{accent_soft};border:1px solid #bbf7d0;\">
-          <div style=\"font-size:15px;font-weight:700;color:{accent};\">Everything matched for this revision</div>
-          <div style=\"margin-top:6px;font-size:13px;line-height:1.5;color:#334155;\">
-            The documented Wiki build actions are represented by the automation script.
-            Internal setup and cleanup details were not treated as problems.
-          </div>
+        <div style=\"margin-top:24px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:13px;line-height:1.6;color:#374151;\">
+          <strong style=\"color:{accent};\">{escape(result_label)}.</strong>
+          The documented Wiki build actions are represented by the automation script.
         </div>
         """
 
@@ -195,14 +204,14 @@ def _html_body(
     if pr_url:
         safe_pr_url = escape(pr_url, quote=True)
         follow_up += f"""
-        <div style=\"margin-top:20px;padding:14px 16px;border-radius:9px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;\">
-          <strong>Draft pull request created.</strong>
-          <a href=\"{safe_pr_url}\" style=\"color:#1d4ed8;\">Open the pull request</a>
+        <div style=\"margin-top:20px;padding-top:14px;border-top:1px solid #e5e7eb;font-size:13px;color:#374151;\">
+          <strong>Pull request:</strong>
+          <a href=\"{safe_pr_url}\" style=\"color:#155eef;\">Open the draft pull request</a>
         </div>
         """
     if action_error:
         follow_up += f"""
-        <div style=\"margin-top:12px;padding:14px 16px;border-radius:9px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;\">
+        <div style=\"margin-top:12px;padding-top:12px;border-top:1px solid #e5e7eb;font-size:13px;color:#92400e;\">
           <strong>Follow-up warning:</strong> {escape(action_error)}
         </div>
         """
@@ -222,61 +231,99 @@ def _html_body(
 
     return f"""<!doctype html>
 <html>
-  <body style=\"margin:0;padding:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#0f172a;\">
-    <div style=\"padding:28px 12px;text-align:center;\">
-      <table role=\"presentation\" align=\"center\" cellpadding=\"0\" cellspacing=\"0\" width=\"680\" style=\"width:100%;max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;text-align:left;\">
+  <body style=\"margin:0;padding:0;background:#f5f6f8;font-family:Arial,Helvetica,sans-serif;color:#111827;\">
+    <table role=\"presentation\" align=\"center\" cellpadding=\"0\" cellspacing=\"0\" width=\"100%\" style=\"width:100%;background:#f5f6f8;\">
+      <tr><td align=\"center\" style=\"padding:24px 12px;\">
+      <table role=\"presentation\" align=\"center\" cellpadding=\"0\" cellspacing=\"0\" width=\"660\" style=\"width:100%;max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #d9dee7;text-align:left;\">
         <tr>
-          <td style=\"padding:24px 28px;background:#111827;\">
-            <div style=\"font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#93c5fd;\">BuildGuard</div>
-            <div style=\"margin-top:10px;font-size:24px;line-height:1.2;font-weight:700;color:#ffffff;\">{escape(report.package)} <span style=\"font-weight:400;color:#cbd5e1;\">{escape(version)}</span></div>
-            <div style=\"margin-top:14px;display:inline-block;padding:6px 10px;border-radius:999px;background:{accent};font-size:12px;font-weight:700;color:#ffffff;\">{escape(result_label)}</div>
+          <td style=\"border-top:4px solid #1f2937;padding:22px 28px 18px;\">
+            <div style=\"font-size:12px;font-weight:700;letter-spacing:.04em;color:#6b7280;\">BUILDGUARD REPORT</div>
+            <div style=\"margin-top:8px;font-size:22px;line-height:1.25;font-weight:700;color:#111827;\">{escape(report.package)}</div>
+            <div style=\"margin-top:4px;font-size:13px;color:#6b7280;\">Version {escape(version)}</div>
           </td>
         </tr>
         <tr>
-          <td style=\"padding:26px 28px 30px;\">
-            <div style=\"font-size:15px;line-height:1.6;color:#334155;\">{escape(report.overview)}</div>
-            <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;margin-top:22px;\"><tr>{stats_html}</tr></table>
+          <td style=\"padding:22px 28px 28px;\">
+            <div style=\"font-size:15px;font-weight:700;color:{accent};\">{escape(result_label)}</div>
+            <div style=\"margin-top:9px;font-size:13px;line-height:1.6;color:#374151;\">{escape(report.overview)}</div>
+            <h2 style=\"margin:24px 0 4px;font-size:16px;color:#111827;\">Summary</h2>
+            <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;border-top:1px solid #e5e7eb;\">{summary_html}</table>
             {attention_section}
             {follow_up}
-            <div style=\"margin-top:28px;padding-top:18px;border-top:1px solid #e2e8f0;font-size:12px;line-height:1.7;color:#64748b;\">
-              <strong style=\"color:#475569;\">Compared sources</strong><br>{source_html}
+            <div style=\"margin-top:26px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:12px;line-height:1.8;color:#6b7280;\">
+              <strong style=\"color:#374151;\">Sources</strong><br>{source_html}
             </div>
           </td>
         </tr>
         <tr>
-          <td style=\"padding:16px 28px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;\">
-            This notification was generated automatically by BuildGuard.
+          <td style=\"padding:14px 28px;border-top:1px solid #e5e7eb;background:#fafafa;font-size:11px;color:#9ca3af;\">
+            Automated BuildGuard notification
           </td>
         </tr>
       </table>
-    </div>
+      </td></tr>
+    </table>
   </body>
 </html>"""
 
 
 def _finding_html(finding) -> str:
-    """Render one actionable finding for the HTML email."""
+    """Render one actionable finding in the HTML email."""
     category = _category_label(finding.category)
-    locations = [evidence.location for evidence in finding.script if evidence.location]
-    if finding.wiki and finding.wiki.location:
-        locations.insert(0, f"Wiki: {finding.wiki.location}")
-    location_html = "<br>".join(escape(location) for location in locations[:4])
-    if len(locations) > 4:
-        location_html += f"<br>+ {len(locations) - 4} more location(s)"
-    location_block = (
-        f'<div style="margin-top:10px;font-size:11px;line-height:1.5;color:#64748b;">{location_html}</div>'
-        if location_html
-        else ""
-    )
+    evidence_html = ""
+    sections = [("Wiki", finding.wiki)]
+    sections.extend(("Script", evidence) for evidence in finding.script)
+    for source_label, evidence in sections:
+        if evidence is None:
+            continue
+        line_label = _evidence_line_label(evidence)
+        commands = evidence.commands
+        if not line_label and not commands:
+            continue
+        line_html = f"<span style=\"color:#6b7280;\">{escape(line_label)}</span><br>" if line_label else ""
+        command_html = (
+            f'<pre style="margin:5px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 monospace;color:#1f2937;">{escape(chr(10).join(commands))}</pre>'
+            if commands
+            else ""
+        )
+        evidence_html += (
+            f'<div style="margin-top:12px;padding-top:10px;border-top:1px solid #f0f2f5;font-size:11px;line-height:1.5;color:#4b5563;">'
+            f'<strong>{source_label}</strong><br>{line_html}{command_html}</div>'
+        )
     return f"""
-    <div style=\"margin-top:12px;padding:16px 18px;border:1px solid #fecaca;border-left:4px solid #dc2626;border-radius:9px;background:#fffafa;\">
-      <div style=\"font-size:11px;letter-spacing:.05em;text-transform:uppercase;font-weight:700;color:#b91c1c;\">{escape(finding.id)} · {escape(category)}</div>
-      <div style=\"margin-top:7px;font-size:15px;font-weight:700;color:#0f172a;\">{escape(finding.title)}</div>
-      <div style=\"margin-top:8px;font-size:13px;line-height:1.55;color:#334155;\">{escape(finding.explanation)}</div>
-      <div style=\"margin-top:10px;padding:10px 12px;border-radius:6px;background:#fff1f2;font-size:13px;line-height:1.5;color:#881337;\"><strong>Recommended next step:</strong> {escape(finding.recommendation)}</div>
-      {location_block}
+    <div style=\"margin-top:16px;padding-top:14px;border-top:2px solid #e5e7eb;\">
+      <div style=\"font-size:11px;font-weight:700;letter-spacing:.04em;color:#6b7280;\">{escape(finding.id)} · {escape(category)}</div>
+      <div style=\"margin-top:6px;font-size:15px;font-weight:700;color:#111827;\">{escape(finding.title)}</div>
+      <div style=\"margin-top:7px;font-size:13px;line-height:1.55;color:#374151;\">{escape(finding.explanation)}</div>
+      {evidence_html}
+      <div style=\"margin-top:12px;font-size:13px;line-height:1.55;color:#374151;\"><strong>Next step:</strong> {escape(finding.recommendation)}</div>
     </div>
     """
+
+
+def _evidence_line_label(evidence) -> str:
+    if evidence.line_start is not None:
+        end = evidence.line_end or evidence.line_start
+        return (
+            f"Line {end}"
+            if end == evidence.line_start
+            else f"Lines {evidence.line_start}–{end}"
+        )
+    match = re.search(r"\blines?\s+(\d+)(?:\s*[-–]\s*(\d+))?", evidence.location, re.I)
+    if not match:
+        return ""
+    start, end = match.groups()
+    return f"Line {start}" if not end or end == start else f"Lines {start}–{end}"
+
+
+def _plain_evidence_lines(label: str, evidence) -> list[str]:
+    if evidence is None:
+        return []
+    line_label = _evidence_line_label(evidence)
+    commands = evidence.commands
+    result = [f"{label} · {line_label}" if line_label else label]
+    result.extend(f"  {command}" for command in commands)
+    return result
 
 
 def _category_label(category) -> str:

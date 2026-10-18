@@ -57,6 +57,7 @@ class WebhookJob:
     attempts: int
     last_error: str | None
     updated_at: str
+    trigger_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,68 @@ class ParsedSourceRepository:
             ).fetchone()
         return self._stored_comparison_report(row, key) if row else None
 
+    def get_latest_comparison_report_for_sources(
+        self,
+        key: ComparisonCacheKey,
+    ) -> StoredComparisonReport | None:
+        """Load the newest report for an exact source revision pair.
+
+        Parser and analysis versions are deliberately excluded here. The UI's
+        normal compare action should show the last result when neither input
+        changed; users can explicitly request a fresh analysis when desired.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, updated_at, report_json,
+                       wiki_parser_version, bash_parser_version, analysis_version
+                FROM comparison_reports
+                WHERE package = ?
+                  AND version = ?
+                  AND wiki_repository = ?
+                  AND wiki_path = ?
+                  AND wiki_ref = ?
+                  AND wiki_revision = ?
+                  AND script_repository = ?
+                  AND script_path = ?
+                  AND script_ref = ?
+                  AND script_revision = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (
+                    key.package,
+                    key.version,
+                    key.wiki_repository,
+                    key.wiki_path,
+                    key.wiki_ref,
+                    key.wiki_revision,
+                    key.script_repository,
+                    key.script_path,
+                    key.script_ref,
+                    key.script_revision,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+
+        stored_key = ComparisonCacheKey(
+            package=key.package,
+            version=key.version,
+            wiki_repository=key.wiki_repository,
+            wiki_path=key.wiki_path,
+            wiki_ref=key.wiki_ref,
+            wiki_revision=key.wiki_revision,
+            script_repository=key.script_repository,
+            script_path=key.script_path,
+            script_ref=key.script_ref,
+            script_revision=key.script_revision,
+            wiki_parser_version=row[3],
+            bash_parser_version=row[4],
+            analysis_version=row[5],
+        )
+        return self._stored_comparison_report((row[0], row[1], row[2]), stored_key)
+
     def save_comparison_report(
         self,
         key: ComparisonCacheKey,
@@ -417,13 +480,14 @@ class ParsedSourceRepository:
         version: str | None,
         refresh_wiki: bool,
         refresh_bash: bool,
+        trigger_id: str | None = None,
     ) -> WebhookJob:
-        """Create or merge pending work for one package/version."""
+        """Create or merge pending work for one package/version/event."""
         updated_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, refresh_wiki, refresh_bash
+                SELECT id, refresh_wiki, refresh_bash, trigger_id
                 FROM webhook_jobs
                 WHERE package = ?
                   AND version IS ?
@@ -434,16 +498,43 @@ class ParsedSourceRepository:
                 (package, version),
             ).fetchone()
             if row is None:
-                cursor = connection.execute(
-                    """
-                    INSERT INTO webhook_jobs (
-                        package, version, refresh_wiki, refresh_bash,
-                        status, attempts, last_error, updated_at
-                    ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?)
-                    """,
-                    (package, version, refresh_wiki, refresh_bash, updated_at),
-                )
-                job_id = int(cursor.lastrowid)
+                existing_event = None
+                if trigger_id:
+                    existing_event = connection.execute(
+                        """
+                        SELECT id, status
+                        FROM webhook_jobs
+                        WHERE package = ?
+                          AND version IS ?
+                          AND trigger_id = ?
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (package, version, trigger_id),
+                    ).fetchone()
+                if existing_event is not None:
+                    job_id = int(existing_event[0])
+                    if existing_event[1] != "complete":
+                        connection.execute(
+                            """
+                            UPDATE webhook_jobs
+                            SET status = 'pending', attempts = 0,
+                                last_error = NULL, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (updated_at, job_id),
+                        )
+                else:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO webhook_jobs (
+                            package, version, refresh_wiki, refresh_bash,
+                            status, attempts, last_error, updated_at, trigger_id
+                        ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?)
+                        """,
+                        (package, version, refresh_wiki, refresh_bash, updated_at, trigger_id),
+                    )
+                    job_id = int(cursor.lastrowid)
             else:
                 job_id = int(row[0])
                 connection.execute(
@@ -451,12 +542,14 @@ class ParsedSourceRepository:
                     UPDATE webhook_jobs
                     SET refresh_wiki = ?,
                         refresh_bash = ?,
+                        trigger_id = COALESCE(?, trigger_id),
                         updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         bool(row[1]) or refresh_wiki,
                         bool(row[2]) or refresh_bash,
+                        trigger_id,
                         updated_at,
                         job_id,
                     ),
@@ -483,7 +576,7 @@ class ParsedSourceRepository:
             row = connection.execute(
                 """
                 SELECT id, package, version, refresh_wiki, refresh_bash,
-                       status, attempts, last_error, updated_at
+                       status, attempts, last_error, updated_at, trigger_id
                 FROM webhook_jobs
                 WHERE id = ?
                 """,
@@ -501,7 +594,7 @@ class ParsedSourceRepository:
             row = connection.execute(
                 """
                 SELECT id, package, version, refresh_wiki, refresh_bash,
-                       status, attempts, last_error, updated_at
+                       status, attempts, last_error, updated_at, trigger_id
                 FROM webhook_jobs
                 WHERE package = ?
                   AND version IS ?
@@ -518,7 +611,7 @@ class ParsedSourceRepository:
             rows = connection.execute(
                 """
                 SELECT id, package, version, refresh_wiki, refresh_bash,
-                       status, attempts, last_error, updated_at
+                       status, attempts, last_error, updated_at, trigger_id
                 FROM webhook_jobs
                 WHERE status = 'pending'
                 ORDER BY id
@@ -532,7 +625,7 @@ class ParsedSourceRepository:
             current = connection.execute(
                 """
                 SELECT id, package, version, refresh_wiki, refresh_bash,
-                       status, attempts, last_error, updated_at
+                       status, attempts, last_error, updated_at, trigger_id
                 FROM webhook_jobs
                 WHERE id = ? AND status = 'pending'
                 """,
@@ -563,6 +656,7 @@ class ParsedSourceRepository:
             attempts=int(current[6]) + 1,
             last_error=None,
             updated_at=datetime.now(UTC).isoformat(),
+            trigger_id=current[9],
         )
 
     def finish_webhook_job(
@@ -692,6 +786,7 @@ class ParsedSourceRepository:
             attempts=int(row[6]),
             last_error=row[7],
             updated_at=str(row[8]),
+            trigger_id=row[9],
         )
 
     @staticmethod
@@ -774,7 +869,8 @@ class ParsedSourceRepository:
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    trigger_id TEXT
                 )
                 """
             )
@@ -806,6 +902,14 @@ class ParsedSourceRepository:
             if "source_content" not in columns:
                 connection.execute(
                     "ALTER TABLE parsed_sources ADD COLUMN source_content TEXT"
+                )
+            webhook_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(webhook_jobs)")
+            }
+            if "trigger_id" not in webhook_columns:
+                connection.execute(
+                    "ALTER TABLE webhook_jobs ADD COLUMN trigger_id TEXT"
                 )
 
     @contextmanager

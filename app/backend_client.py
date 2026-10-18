@@ -49,12 +49,30 @@ class BuildGuardAPIClient:
             raise BuildGuardAPIError("BuildGuard API returned an invalid report list")
         return reports
 
-    def compare(self, package: str) -> ComparisonReport:
-        payload = self._request("POST", "/api/compare", {"package": package})
+    def compare(
+        self,
+        package: str,
+        *,
+        force_comparison: bool = False,
+    ) -> ComparisonReport:
+        payload = self._request(
+            "POST",
+            "/api/compare",
+            {"package": package, "force_comparison": force_comparison},
+        )
         return ComparisonReport.model_validate(payload)
 
-    def start_comparison(self, package: str) -> str:
-        payload = self._request("POST", "/api/compare-jobs", {"package": package})
+    def start_comparison(
+        self,
+        package: str,
+        *,
+        force_comparison: bool = False,
+    ) -> str:
+        payload = self._request(
+            "POST",
+            "/api/compare-jobs",
+            {"package": package, "force_comparison": force_comparison},
+        )
         job_id = payload.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             raise BuildGuardAPIError("BuildGuard API did not return a comparison job ID")

@@ -7,3 +7,4 @@ class LLMRequest(BaseModel):
     system_prompt: str
     user_prompt: str
     structured_output_instructions: str | None = None
+    max_output_tokens: int | None = None

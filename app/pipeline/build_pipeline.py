@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -9,16 +10,21 @@ from app.models.step import ActionType, BuildStep
 from app.models.validation import (
     AIComparisonMatch,
     AIComparisonResult,
+    AIValueDifference,
     DiscrepancyCategory,
     MatchStatus,
     StepMatch,
     ValidationResult,
 )
-from app.matching.semantic_matcher import normalize_validation_result
+from app.matching.semantic_matcher import (
+    _versioned_package_disagreement,
+    normalize_validation_result,
+)
 from app.parsers.bash_normalizer import normalize_bash
 from app.parsers.bash_parser import parse_script
 from app.parsers.semantic_parser import parse_semantic_facts
 from app.parsers.wiki_parser import parse_wiki
+from app.parsers.wiki_semantic_parser import complete_wiki_instruction
 from app.pipeline.context import neighbouring_text, step_context
 from app.sources.github import GitHubSource, GitHubWikiPage
 
@@ -27,6 +33,69 @@ WIKI_EXTRACTION_CHUNK_CHARS = 6000
 COMPARISON_CHUNK_STEPS = 8
 COMPARISON_SINGLE_REQUEST_MAX_STEPS = 24
 COMPARISON_SINGLE_REQUEST_MAX_CHARS = 18000
+COMPARISON_BATCH_REPAIR_ATTEMPTS = 2
+COMPARISON_CANDIDATES_PER_WIKI_STEP = 8
+COMPARISON_MAX_BASH_CANDIDATES = 40
+COMPARISON_OUTPUT_TOKEN_BUDGET = 4096
+
+# These words occur in almost every shell operation and do not help retrieve
+# the Bash implementation of a Wiki action.  Keeping retrieval deterministic
+# means the LLM still makes the semantic decision, but does not have to scan
+# the entire script for every Wiki batch.
+_COMPARISON_SEARCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "command",
+    "commands",
+    "component",
+    "description",
+    "do",
+    "does",
+    "dockerfile",
+    "environment",
+    "excerpt",
+    "file",
+    "from",
+    "for",
+    "if",
+    "in",
+    "install",
+    "into",
+    "is",
+    "it",
+    "line",
+    "lines",
+    "of",
+    "on",
+    "package",
+    "packages",
+    "path",
+    "paths",
+    "repository",
+    "run",
+    "script",
+    "section",
+    "source",
+    "or",
+    "step",
+    "steps",
+    "that",
+    "the",
+    "this",
+    "to",
+    "use",
+    "using",
+    "url",
+    "urls",
+    "version",
+    "with",
+}
 
 
 def _comparison_bash_ids(match: AIComparisonMatch) -> list[str]:
@@ -42,24 +111,288 @@ def _comparison_bash_ids(match: AIComparisonMatch) -> list[str]:
 
 
 def _is_reusable_parameterized_step(step: BuildStep) -> bool:
-    """Allow one parameterized package/config step to cover Wiki variants."""
-    commands = " ".join(step.commands).lower()
-    if step.action == ActionType.INSTALL_PACKAGE:
-        values = " ".join(step.packages).lower() + " " + commands
-        return any(
-            marker in values
-            for marker in ("${jver}", "$jver", "${allowerasing}")
+    """Allow explicitly parameterized operations to cover supported variants.
+
+    Reuse is intentionally tied to runtime options/defaults supplied by source
+    analysis, rather than a package name or a particular runtime such as Java.
+    """
+    if step.action not in {
+        ActionType.INSTALL_PACKAGE,
+        ActionType.DOWNLOAD,
+        ActionType.SET_VARIABLE,
+        ActionType.CONFIGURE,
+        ActionType.RUN_COMMAND,
+    }:
+        return False
+    if not (step.context.runtime_options or step.context.runtime_defaults):
+        return False
+
+    payload = json.dumps(
+        {
+            "packages": step.packages,
+            "commands": step.commands,
+            "environment": step.environment,
+            "version": step.version,
+            "urls": step.urls,
+        },
+        ensure_ascii=False,
+    )
+    return bool(re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*", payload))
+
+
+def _is_shareable_configuration_step(step: BuildStep) -> bool:
+    """Identify declarations that can support several semantic Wiki rows."""
+    return (
+        step.action == ActionType.SET_VARIABLE
+        and "configuration" in step.context.context_labels
+    )
+
+
+def _is_reusable_comparison_step(step: BuildStep) -> bool:
+    """Return whether one Bash node may support more than one Wiki action."""
+    return _is_reusable_parameterized_step(step) or _is_shareable_configuration_step(step)
+
+
+def _comparison_search_tokens(value: Any) -> set[str]:
+    """Return meaningful tokens used to retrieve semantic Bash candidates."""
+    if value is None:
+        return set()
+    if isinstance(value, dict):
+        tokens: set[str] = set()
+        for item in value.values():
+            tokens.update(_comparison_search_tokens(item))
+        return tokens
+    if isinstance(value, (list, tuple, set)):
+        tokens: set[str] = set()
+        for item in value:
+            tokens.update(_comparison_search_tokens(item))
+        return tokens
+
+    raw = str(value).casefold()
+    # Split camel-case names as well as shell punctuation.  For example,
+    # "communityRepo" and "community-repo" should retrieve the same action.
+    raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+    tokens = set(re.findall(r"[a-z0-9]+", raw))
+    return {
+        token
+        for token in tokens
+        if len(token) > 1 and token not in _COMPARISON_SEARCH_STOPWORDS
+    }
+
+
+def _comparison_step_search_text(step: BuildStep) -> dict[str, Any]:
+    """Expose source-owned semantic fields to deterministic candidate search."""
+    context = step.context
+    return {
+        "action": step.action.value,
+        "description": step.description,
+        "packages": step.packages,
+        "commands": step.commands,
+        "paths": step.paths,
+        "urls": step.urls,
+        "component": step.component,
+        "version": step.version,
+        "repository": step.repository,
+        "ref": step.ref,
+        "commit": step.commit,
+        "docker_image": step.docker_image,
+        "dockerfile": step.dockerfile,
+        "build_args": step.build_args,
+        "build_arg_names": list(step.build_args),
+        "environment": step.environment,
+        "environment_names": list(step.environment),
+        "patches": step.patches,
+        "build_tool": step.build_tool,
+        "section": context.section,
+        "subsection": context.subsection,
+        "heading_path": context.heading_path,
+        "source_excerpt": context.source_excerpt,
+    }
+
+
+def _comparison_candidate_score(wiki_step: BuildStep, bash_step: BuildStep) -> float:
+    """Score one Bash step for a Wiki action without making a match decision."""
+    wiki_fields = _comparison_step_search_text(wiki_step)
+    bash_fields = _comparison_step_search_text(bash_step)
+    wiki_tokens = _comparison_search_tokens(wiki_fields)
+    bash_tokens = _comparison_search_tokens(bash_fields)
+    shared_tokens = wiki_tokens & bash_tokens
+    score = float(min(len(shared_tokens), 12))
+
+    # Commands, URLs, packages, and paths carry the actual operation.  Give
+    # their overlap more weight than headings or parser context, which often
+    # repeat the same words across an entire document.
+    for field in (
+        "commands",
+        "packages",
+        "urls",
+        "paths",
+        "description",
+        "component",
+        "build_tool",
+    ):
+        field_overlap = _comparison_search_tokens(wiki_fields[field]) & _comparison_search_tokens(
+            bash_fields[field]
         )
-    if step.action == ActionType.SET_VARIABLE:
-        return "java_home" in commands and any(
-            marker in commands for marker in ("${jver}", "$jver")
+        score += min(len(field_overlap), 6) * 2
+
+    wiki_component = _comparison_search_tokens(wiki_step.component)
+    bash_component = _comparison_search_tokens(bash_step.component)
+    if wiki_component and bash_component:
+        if wiki_component == bash_component:
+            score += 32
+        else:
+            score += 8 * len(wiki_component & bash_component)
+
+    if wiki_step.action == bash_step.action:
+        score += 5
+    elif wiki_step.action in {
+        ActionType.RUN_COMMAND,
+        ActionType.CONFIGURE,
+    } and bash_step.action in {
+        ActionType.RUN_COMMAND,
+        ActionType.CONFIGURE,
+        ActionType.BUILD_IMAGE,
+        ActionType.RUN_TEST,
+    }:
+        score += 2
+
+    # A parameterized Bash operation is a strong candidate for a concrete
+    # Wiki variant when its static package/tool tokens overlap.  The final AI
+    # comparison still decides whether the parameter really covers the Wiki
+    # value; this only keeps the operation in the evidence set.
+    if (bash_step.context.runtime_options or bash_step.context.runtime_defaults) and len(
+        shared_tokens
+    ) >= 2:
+        score += 10
+
+    # Exact identity fields are much stronger than a coincidental token
+    # overlap.  This is important for versions, commits, repositories, and
+    # Docker images, where a related component can still have different data.
+    for field in (
+        "repository",
+        "version",
+        "ref",
+        "commit",
+        "docker_image",
+        "build_tool",
+    ):
+        wiki_value = getattr(wiki_step, field)
+        bash_value = getattr(bash_step, field)
+        if wiki_value and bash_value:
+            wiki_normalized = " ".join(str(wiki_value).split()).casefold()
+            bash_normalized = " ".join(str(bash_value).split()).casefold()
+            if wiki_normalized == bash_normalized:
+                score += 18
+            elif wiki_normalized in bash_normalized or bash_normalized in wiki_normalized:
+                score += 6
+
+    wiki_context = _comparison_search_tokens(
+        [wiki_step.context.section, wiki_step.context.subsection, wiki_step.context.heading_path]
+    )
+    bash_context = _comparison_search_tokens(
+        [bash_step.context.section, bash_step.context.subsection, bash_step.context.heading_path]
+    )
+    score += min(len(wiki_context & bash_context), 4) * 2
+    return score
+
+
+def _select_comparison_bash_candidates(
+    wiki_steps: list[BuildStep],
+    bash_steps: list[BuildStep],
+    used_bash_ids: set[str],
+) -> list[BuildStep]:
+    """Select relevant Bash actions for a Wiki batch before invoking the LLM.
+
+    This is retrieval, not classification.  The complete source is still
+    used for the final EXTRA calculation, while the model receives a bounded
+    set of likely implementations plus all exact component peers.  Parameter
+    substitution and grouped actions therefore remain available without
+    repeatedly sending cleanup and helper statements to the model.
+    """
+    available = [
+        step
+        for step in bash_steps
+        if step.id not in used_bash_ids or _is_reusable_comparison_step(step)
+    ]
+    if len(available) <= COMPARISON_MAX_BASH_CANDIDATES:
+        return available
+
+    selected_ids: set[str] = set()
+    scores: dict[str, float] = {}
+    for wiki_step in wiki_steps:
+        ranked = sorted(
+            [
+                (
+                    _comparison_candidate_score(wiki_step, bash_step),
+                    bash_step,
+                )
+                for bash_step in available
+            ],
+            key=lambda item: (-item[0], item[1].order),
         )
-    if step.action == ActionType.DOWNLOAD:
-        return (
-            (step.context.subsection or "").lower() == "installjava"
-            and bool(step.context.runtime_options.get("JAVA_PROVIDED"))
-        )
-    return False
+        for score, bash_step in ranked[:COMPARISON_CANDIDATES_PER_WIKI_STEP]:
+            selected_ids.add(bash_step.id)
+            scores[bash_step.id] = max(scores.get(bash_step.id, 0.0), score)
+
+            # When a strong operation is found inside a large helper, retain
+            # its nearby shell operations too.  Clone/fetch/checkout/patch/
+            # build sequences are often represented by separate AST nodes but
+            # are one semantic build action to the comparison model.
+            if score >= 25 and bash_step.context.subsection:
+                for neighbour in available:
+                    if (
+                        neighbour.context.subsection == bash_step.context.subsection
+                        and abs(neighbour.order - bash_step.order) <= 2
+                    ):
+                        selected_ids.add(neighbour.id)
+                        scores[neighbour.id] = max(
+                            scores.get(neighbour.id, 0.0),
+                            score - 1,
+                        )
+
+        # A component is intentionally grouped across clone, checkout, patch,
+        # and build commands.  Keep all currently available operations with
+        # the exact component even when one of them has weak lexical overlap.
+        component_tokens = _comparison_search_tokens(wiki_step.component)
+        if component_tokens:
+            for bash_step in available:
+                if _comparison_search_tokens(bash_step.component) == component_tokens:
+                    selected_ids.add(bash_step.id)
+                    scores[bash_step.id] = max(
+                        scores.get(bash_step.id, 0.0),
+                        28.0,
+                    )
+
+        # Keep a small function-level group together.  This is what allows a
+        # Wiki Java or dependency action to be matched to the install,
+        # configuration, and PATH statements in one Bash helper.  Large
+        # orchestration functions are deliberately excluded; their exact
+        # component/repository candidates are selected by the normal ranking.
+        subsection = wiki_step.context.subsection
+        if subsection:
+            subsection_peers = [
+                bash_step
+                for bash_step in available
+                if bash_step.context.subsection == subsection
+            ]
+            if 1 < len(subsection_peers) <= 16:
+                for bash_step in subsection_peers:
+                    selected_ids.add(bash_step.id)
+                    scores[bash_step.id] = max(
+                        scores.get(bash_step.id, 0.0),
+                        20.0,
+                    )
+
+    if len(selected_ids) > COMPARISON_MAX_BASH_CANDIDATES:
+        selected_ids = {
+            step.id
+            for step in sorted(
+                (step for step in available if step.id in selected_ids),
+                key=lambda step: (-scores.get(step.id, 0.0), step.order),
+            )[:COMPARISON_MAX_BASH_CANDIDATES]
+        }
+    return [step for step in available if step.id in selected_ids]
 
 
 def _comparison_batch_issue(
@@ -68,7 +401,7 @@ def _comparison_batch_issue(
     available_bash_ids: set[str],
     used_bash_ids: set[str],
     bash_by_id: dict[str, BuildStep],
-) -> tuple[str | None, str] | None:
+) -> tuple[str | None, str, str | None] | None:
     """Return a source-ID contract violation before accepting a batch."""
     seen_wiki_ids: set[str] = set()
     seen_bash_ids: set[str] = set()
@@ -86,32 +419,53 @@ def _comparison_batch_issue(
             return (
                 None,
                 "the batch included an EXTRA entry; extras are derived by the app",
+                None,
             )
 
         bash_ids = _comparison_bash_ids(match)
         if len(bash_ids) != len(set(bash_ids)):
-            return wiki_id, f"Wiki step {wiki_id} repeats a Bash ID"
+            return wiki_id, f"Wiki step {wiki_id} repeats a Bash ID", None
         if match.status in {MatchStatus.MATCHED, MatchStatus.CONFLICT} and not bash_ids:
-            return wiki_id, f"Wiki step {wiki_id} is {match.status.value} without a Bash ID"
+            return (
+                wiki_id,
+                f"Wiki step {wiki_id} is {match.status.value} without a Bash ID",
+                None,
+            )
         if match.status in {MatchStatus.MISSING, MatchStatus.OUT_OF_SCOPE} and bash_ids:
-            return wiki_id, f"Wiki step {wiki_id} is {match.status.value} but includes Bash IDs"
+            return (
+                wiki_id,
+                f"Wiki step {wiki_id} is {match.status.value} but includes Bash IDs",
+                None,
+            )
 
         for bash_id in bash_ids:
             if bash_id not in available_bash_ids:
-                return wiki_id, f"Bash ID {bash_id} is not available in this batch"
+                return (
+                    wiki_id,
+                    f"Bash ID {bash_id} is not available in this batch",
+                    None,
+                )
             if (
                 bash_id in used_bash_ids or bash_id in seen_bash_ids
-            ) and not _is_reusable_parameterized_step(bash_by_id[bash_id]):
-                return wiki_id, f"Bash ID {bash_id} is assigned to more than one Wiki step"
+            ) and not _is_reusable_comparison_step(bash_by_id[bash_id]):
+                return (
+                    wiki_id,
+                    f"Bash ID {bash_id} is assigned to more than one Wiki step",
+                    bash_id,
+                )
             seen_bash_ids.add(bash_id)
         seen_wiki_ids.add(wiki_id)
 
     omitted_wiki_ids = expected_wiki_ids - seen_wiki_ids
     if omitted_wiki_ids:
         omitted = ", ".join(sorted(omitted_wiki_ids))
-        return sorted(omitted_wiki_ids)[0], f"the response omitted Wiki step(s): {omitted}"
+        return (
+            sorted(omitted_wiki_ids)[0],
+            f"the response omitted Wiki step(s): {omitted}",
+            None,
+        )
     if malformed_wiki_rows:
-        return None, "the response used an unknown or duplicate Wiki step ID"
+        return None, "the response used an unknown or duplicate Wiki step ID", None
     return None
 
 
@@ -143,6 +497,119 @@ def _comparison_batch_result(content: str, batch_index: int) -> AIComparisonResu
         raise RuntimeError(
             f"LLM returned an invalid result for comparison batch {batch_index}: {error}"
         ) from error
+
+
+def _is_output_limit_error(error: RuntimeError) -> bool:
+    message = str(error).casefold()
+    return "output limit" in message or "maximum output tokens" in message
+
+
+def _alias_bash_candidates(
+    steps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Give the model only batch-local Bash IDs and retain their source mapping."""
+    source_to_alias = {
+        step["id"]: f"candidate-{index}"
+        for index, step in enumerate(steps, start=1)
+    }
+    alias_to_source = {alias: source for source, alias in source_to_alias.items()}
+    aliased_steps: list[dict[str, Any]] = []
+    for step in steps:
+        aliased = dict(step)
+        aliased["id"] = source_to_alias[step["id"]]
+        dependencies = step.get("depends_on")
+        if isinstance(dependencies, list):
+            aliased["depends_on"] = [
+                source_to_alias[dependency]
+                for dependency in dependencies
+                if dependency in source_to_alias
+            ]
+        aliased_steps.append(aliased)
+    return aliased_steps, alias_to_source
+
+
+def _resolve_bash_candidate_ids(
+    result: AIComparisonResult,
+    alias_to_source: dict[str, str],
+) -> AIComparisonResult:
+    """Translate model-facing candidate tokens back to original Bash IDs."""
+    source_ids = set(alias_to_source.values())
+
+    def resolve(value: str) -> str:
+        # Accept a source ID only when it is one of this request's candidates.
+        # This keeps compatibility with providers that return original IDs,
+        # while still rejecting IDs copied from another batch or invented by
+        # the model.
+        if value in alias_to_source:
+            return alias_to_source[value]
+        if value in source_ids:
+            return value
+        return f"__invalid_candidate__:{value}"
+
+    resolved_matches: list[AIComparisonMatch] = []
+    for match in result.matches:
+        bash_ids = [resolve(value) for value in match.bash_step_ids]
+        bash_step_id = (
+            resolve(match.bash_step_id)
+            if match.bash_step_id is not None
+            else None
+        )
+        value_differences = [
+            difference.model_copy(
+                update={
+                    "bash_step_id": resolve(difference.bash_step_id)
+                }
+            )
+            for difference in match.value_differences
+        ]
+        resolved_matches.append(
+            match.model_copy(
+                update={
+                    "bash_step_id": bash_step_id,
+                    "bash_step_ids": bash_ids,
+                    "value_differences": value_differences,
+                }
+            )
+        )
+    return result.model_copy(update={"matches": resolved_matches})
+
+
+def _verified_value_differences(
+    differences: list[AIValueDifference],
+    wiki_step: BuildStep,
+    bash_ids: set[str],
+    bash_steps: dict[str, BuildStep],
+) -> list[AIValueDifference]:
+    """Retain only different values present in the cited source fields."""
+    def field_values(value: Any) -> set[str]:
+        if isinstance(value, str):
+            return {" ".join(value.split()).casefold()}
+        if isinstance(value, dict):
+            return set().union(*(field_values(item) for item in value.values())) if value else set()
+        if isinstance(value, (list, tuple, set)):
+            return set().union(*(field_values(item) for item in value)) if value else set()
+        if value is None:
+            return set()
+        return {str(value).casefold()}
+
+    verified: list[AIValueDifference] = []
+    for difference in differences:
+        if (
+            difference.field not in BuildStep.model_fields
+            or difference.bash_step_id not in bash_ids
+            or difference.wiki_value.strip().casefold()
+            == difference.bash_value.strip().casefold()
+        ):
+            continue
+        bash_step = bash_steps[difference.bash_step_id]
+        wiki_field = field_values(getattr(wiki_step, difference.field))
+        bash_field = field_values(getattr(bash_step, difference.field))
+        if (
+            " ".join(difference.wiki_value.split()).casefold() in wiki_field
+            and " ".join(difference.bash_value.split()).casefold() in bash_field
+        ):
+            verified.append(difference)
+    return verified
 
 
 class BuildPipeline:
@@ -187,7 +654,11 @@ class BuildPipeline:
     def from_wiki(self, markdown: str, name: str = "wiki") -> BuildInstruction:
         document = parse_wiki(markdown, name)
         if sum(len(block.text) for block in document.blocks) > WIKI_EXTRACTION_CHUNK_CHARS:
-            return self._from_wiki_chunks(document)
+            return complete_wiki_instruction(
+                self._from_wiki_chunks(document),
+                markdown,
+                name,
+            )
         semantic_facts = parse_semantic_facts(markdown)
 
         request = self._request(
@@ -216,9 +687,17 @@ class BuildPipeline:
         # original block-by-block API; valid new responses always take the
         # branch above and therefore make exactly one provider call.
         if "steps" in response_data:
-            return self._validate_wiki_instruction(response_data, document)
+            return complete_wiki_instruction(
+                self._validate_wiki_instruction(response_data, document),
+                markdown,
+                name,
+            )
         if {"action", "description"}.issubset(response_data):
-            return self._from_wiki_blocks_legacy(document, response_data)
+            return complete_wiki_instruction(
+                self._from_wiki_blocks_legacy(document, response_data),
+                markdown,
+                name,
+            )
         raise RuntimeError("LLM returned an object without a BuildInstruction steps field for wiki")
 
     def _from_wiki_chunks(self, document: Any) -> BuildInstruction:
@@ -356,20 +835,128 @@ class BuildPipeline:
             system_prompt=(PROMPTS / "comparison.txt").read_text(encoding="utf-8"),
             user_prompt=json.dumps(
                 {
-                    "wiki_instruction": wiki.model_dump(mode="json"),
-                    "buildscript_instruction": bash.model_dump(mode="json"),
+                    "wiki_instruction": {
+                        "name": wiki.name,
+                        "source": wiki.source,
+                        "version": wiki.version,
+                        "steps": wiki_steps,
+                    },
+                    "buildscript_instruction": {
+                        "name": bash.name,
+                        "source": bash.source,
+                        "version": bash.version,
+                        "steps": bash_steps,
+                    },
                     "expected_output": AIComparisonResult.model_json_schema(),
                 },
                 indent=2,
             ),
+            max_output_tokens=COMPARISON_OUTPUT_TOKEN_BUDGET,
         )
-        response_data = _provider_json(self.llm.generate(request).content, "comparison")
+        try:
+            response_data = _provider_json(
+                self.llm.generate(request).content,
+                "comparison",
+            )
+        except RuntimeError as error:
+            if not _is_output_limit_error(error):
+                raise
+            if self.progress is not None:
+                self.progress(
+                    "The comparison response exceeded the output budget; "
+                    "switching to smaller semantic batches..."
+                )
+            return self._compare_in_chunks(wiki, bash, wiki_steps, bash_steps)
         ai_result = AIComparisonResult.model_validate(response_data)
-        return normalize_validation_result(
-            self._validate_comparison(ai_result, wiki, bash),
-            wiki,
-            bash,
+        try:
+            validation = self._validate_comparison(ai_result, wiki, bash)
+        except RuntimeError as error:
+            # The single-request path has the same ownership contract as the
+            # chunked path.  If a provider assigns one ordinary AST node to
+            # multiple Wiki rows, retry through the duplicate-aware chunk
+            # validator instead of surfacing a provider formatting error.
+            if "reused Bash step" not in str(error) and "repeated a Bash step" not in str(error):
+                raise
+            if self.progress is not None:
+                self.progress(
+                    "The comparison reused a Bash action across Wiki rows; "
+                    "rematching with semantic batches..."
+                )
+            return self._compare_in_chunks(wiki, bash, wiki_steps, bash_steps)
+        return normalize_validation_result(validation, wiki, bash)
+
+    def _repair_duplicate_wiki_match(
+        self,
+        wiki_step: BuildStep,
+        wiki_data: dict[str, Any],
+        bash: BuildInstruction,
+        bash_data_by_id: dict[str, dict[str, Any]],
+        used_bash_ids: set[str],
+        claimed_bash_ids: set[str],
+        bash_by_id: dict[str, BuildStep],
+        comparison_prompt: str,
+        batch_index: int,
+    ) -> tuple[AIComparisonMatch | None, str | None]:
+        """Rematch only a Wiki row whose Bash candidate was already claimed.
+
+        A model can correctly identify a shared function but assign one AST
+        node to several Wiki rows.  Repeating the whole batch leaves that
+        ambiguity in the prompt and often reproduces the same invalid answer.
+        Rematching the affected row with claimed non-reusable steps removed
+        preserves the valid rows and gives the model a clean ownership set.
+        """
+        blocked_bash_ids = {
+            bash_id
+            for bash_id in used_bash_ids | claimed_bash_ids
+            if not _is_reusable_comparison_step(bash_by_id[bash_id])
+        }
+        candidates = _select_comparison_bash_candidates(
+            [wiki_step],
+            bash.steps,
+            blocked_bash_ids,
         )
+        candidate_data = [bash_data_by_id[step.id] for step in candidates]
+        model_bash, candidate_to_source = _alias_bash_candidates(candidate_data)
+        request = LLMRequest(
+            system_prompt=comparison_prompt,
+            user_prompt=json.dumps(
+                {
+                    "wiki_steps": [wiki_data],
+                    "available_buildscript_steps": model_bash,
+                    "expected_output": AIComparisonResult.model_json_schema(),
+                    "validation_feedback": (
+                        "Repair only the supplied Wiki step. Earlier Wiki rows "
+                        "already own their Bash candidates. Do not use any Bash "
+                        "step that is absent from this candidate list; choose a "
+                        "different candidate or return missing if no supplied "
+                        "candidate implements this Wiki step. Return exactly one "
+                        "result for the supplied Wiki step and do not return extras."
+                    ),
+                },
+                indent=2,
+            ),
+            max_output_tokens=COMPARISON_OUTPUT_TOKEN_BUDGET,
+        )
+        try:
+            result = _comparison_batch_result(
+                self.llm.generate(request).content,
+                batch_index,
+            )
+        except RuntimeError as error:
+            return None, str(error)
+        result = _resolve_bash_candidate_ids(result, candidate_to_source)
+        issue = _comparison_batch_issue(
+            result,
+            {wiki_step.id},
+            {step.id for step in candidates},
+            used_bash_ids | claimed_bash_ids,
+            bash_by_id,
+        )
+        if issue is not None:
+            return None, issue[1]
+        if len(result.matches) != 1:
+            return None, "the duplicate-assignment repair did not return one Wiki result"
+        return result.matches[0], None
 
     def _compare_in_chunks(
         self,
@@ -382,25 +969,36 @@ class BuildPipeline:
         matches_by_wiki: dict[str, Any] = {}
         used_bash_ids: set[str] = set()
         bash_by_id = {step.id: step for step in bash.steps}
-        batch_count = (
-            len(wiki.steps) + COMPARISON_CHUNK_STEPS - 1
-        ) // COMPARISON_CHUNK_STEPS
+        pending_batches = [
+            wiki.steps[start:start + COMPARISON_CHUNK_STEPS]
+            for start in range(0, len(wiki.steps), COMPARISON_CHUNK_STEPS)
+        ]
+        wiki_data_by_id = {step["id"]: step for step in wiki_data}
+        bash_data_by_id = {step["id"]: step for step in bash_data}
+        completed_batches = 0
         comparison_prompt = (PROMPTS / "comparison_chunk.txt").read_text(
             encoding="utf-8"
         )
 
-        for batch_index, start in enumerate(
-            range(0, len(wiki.steps), COMPARISON_CHUNK_STEPS),
-            start=1,
-        ):
-            wiki_batch = wiki_data[start:start + COMPARISON_CHUNK_STEPS]
+        while pending_batches:
+            wiki_batch_steps = pending_batches.pop(0)
+            wiki_batch = [
+                wiki_data_by_id[step.id]
+                for step in wiki_batch_steps
+            ]
+            batch_index = completed_batches + 1
+            batch_count = completed_batches + 1 + len(pending_batches)
+            available_bash_steps = _select_comparison_bash_candidates(
+                wiki_batch_steps,
+                bash.steps,
+                used_bash_ids,
+            )
             available_bash = [
-                step
-                for step in bash_data
-                if step["id"] not in used_bash_ids
-                or _is_reusable_parameterized_step(bash_by_id[step["id"]])
+                bash_data_by_id[step.id]
+                for step in available_bash_steps
             ]
             available_bash_ids = {step["id"] for step in available_bash}
+            model_bash, candidate_to_source = _alias_bash_candidates(available_bash)
             if self.progress is not None:
                 self.progress(
                     f"Comparing Wiki batch {batch_index}/{batch_count} with AI..."
@@ -410,20 +1008,41 @@ class BuildPipeline:
                 user_prompt=json.dumps(
                     {
                         "wiki_steps": wiki_batch,
-                        "available_buildscript_steps": available_bash,
+                        "available_buildscript_steps": model_bash,
                         "expected_output": AIComparisonResult.model_json_schema(),
                     },
                     indent=2,
                 ),
+                max_output_tokens=COMPARISON_OUTPUT_TOKEN_BUDGET,
             )
-            expected_wiki_ids = {
-                step.id for step in wiki.steps[start:start + COMPARISON_CHUNK_STEPS]
-            }
-            batch_result = _comparison_batch_result(
-                self.llm.generate(request).content,
-                batch_index,
+            expected_wiki_ids = {step.id for step in wiki_batch_steps}
+            try:
+                batch_result = _comparison_batch_result(
+                    self.llm.generate(request).content,
+                    batch_index,
+                )
+            except RuntimeError as error:
+                if not _is_output_limit_error(error) or len(wiki_batch_steps) == 1:
+                    raise
+                split_at = len(wiki_batch_steps) // 2
+                pending_batches = [
+                    wiki_batch_steps[:split_at],
+                    wiki_batch_steps[split_at:],
+                    *pending_batches,
+                ]
+                if self.progress is not None:
+                    self.progress(
+                        f"Comparison batch {batch_index} exceeded the AI output "
+                        f"limit; splitting {len(wiki_batch_steps)} Wiki actions "
+                        "into smaller batches and retrying..."
+                    )
+                continue
+            batch_result = _resolve_bash_candidate_ids(
+                batch_result,
+                candidate_to_source,
             )
-            repaired_wiki_ids: set[str] = set()
+            repair_attempts = 0
+            split_after_repair_limit = False
             while True:
                 validation_issue = _comparison_batch_issue(
                     batch_result,
@@ -435,81 +1054,107 @@ class BuildPipeline:
                 if validation_issue is None:
                     break
 
-                repair_wiki_id, issue_detail = validation_issue
-                if repair_wiki_id is None or repair_wiki_id in repaired_wiki_ids:
+                repair_wiki_id, issue_detail, duplicate_bash_id = validation_issue
+                if repair_attempts >= COMPARISON_BATCH_REPAIR_ATTEMPTS:
+                    target = f"Wiki step {repair_wiki_id}" if repair_wiki_id else "the batch"
                     raise RuntimeError(
-                        f"AI comparison batch {batch_index} failed validation: "
-                        f"{issue_detail}"
+                        f"AI comparison batch {batch_index} could not validate "
+                        f"{target} after {repair_attempts} repair "
+                        f"attempts: {issue_detail}"
                     )
+                repair_attempts += 1
                 if self.progress is not None:
                     self.progress(
-                        f"Retrying comparison batch {batch_index} for "
-                        f"{repair_wiki_id}: repairing its step IDs..."
+                        f"Retrying comparison batch {batch_index} "
+                        f"(attempt {repair_attempts}/"
+                        f"{COMPARISON_BATCH_REPAIR_ATTEMPTS}): {issue_detail}"
                     )
 
-                retained_by_wiki = {
-                    match.wiki_step_id: match
-                    for match in batch_result.matches
-                    if match.wiki_step_id in expected_wiki_ids
-                    and match.wiki_step_id != repair_wiki_id
-                }
-                retained_bash_ids = {
-                    bash_id
-                    for match in retained_by_wiki.values()
-                    for bash_id in _comparison_bash_ids(match)
-                }
-                excluded_bash_ids = used_bash_ids | retained_bash_ids
-                repair_candidates = [
-                    step
-                    for step in bash_data
-                    if step["id"] not in excluded_bash_ids
-                    or _is_reusable_parameterized_step(bash_by_id[step["id"]])
-                ]
-                target_wiki_step = next(
-                    step for step in wiki_batch if step["id"] == repair_wiki_id
-                )
+                if duplicate_bash_id is not None and repair_wiki_id is not None:
+                    claimed_bash_ids = {
+                        claimed_id
+                        for match in batch_result.matches
+                        if match.wiki_step_id != repair_wiki_id
+                        for claimed_id in _comparison_bash_ids(match)
+                    }
+                    repaired_match, repair_error = self._repair_duplicate_wiki_match(
+                        next(
+                            step
+                            for step in wiki_batch_steps
+                            if step.id == repair_wiki_id
+                        ),
+                        wiki_data_by_id[repair_wiki_id],
+                        bash,
+                        bash_data_by_id,
+                        used_bash_ids,
+                        claimed_bash_ids,
+                        bash_by_id,
+                        comparison_prompt,
+                        batch_index,
+                    )
+                    if repaired_match is not None:
+                        batch_result = batch_result.model_copy(
+                            update={
+                                "matches": [
+                                    repaired_match
+                                    if match.wiki_step_id == repair_wiki_id
+                                    else match
+                                    for match in batch_result.matches
+                                ]
+                            }
+                        )
+                        continue
+                    if repair_error:
+                        issue_detail = repair_error
+
                 repair_request = LLMRequest(
                     system_prompt=comparison_prompt,
                     user_prompt=json.dumps(
                         {
-                            "wiki_steps": [target_wiki_step],
-                            "available_buildscript_steps": repair_candidates,
+                            "wiki_steps": wiki_batch,
+                            "available_buildscript_steps": model_bash,
                             "expected_output": AIComparisonResult.model_json_schema(),
                             "validation_feedback": (
-                                f"Repair only Wiki step {repair_wiki_id}. The previous "
-                                f"batch had this source-ID issue: {issue_detail}. "
-                                "Return exactly one match for that Wiki ID. Choose "
-                                "only from the available Bash IDs; use matched or "
-                                "conflict only when you can name at least one exact "
-                                "Bash ID. Otherwise use missing with empty Bash ID "
-                                "fields."
+                                f"The previous response failed validation: {issue_detail}. "
+                                "Re-evaluate this entire Wiki batch and return exactly "
+                                "one result per supplied Wiki step. Use only the "
+                                "batch-local candidate IDs shown in the available "
+                                "Bash steps. For an unmatched Wiki step, use missing "
+                                "with empty Bash ID fields. Do not return extras."
                             ),
                         },
                         indent=2,
                     ),
+                    max_output_tokens=COMPARISON_OUTPUT_TOKEN_BUDGET,
                 )
-                repair_result = _comparison_batch_result(
-                    self.llm.generate(repair_request).content,
-                    batch_index,
-                )
-                if (
-                    len(repair_result.matches) != 1
-                    or repair_result.matches[0].wiki_step_id != repair_wiki_id
-                ):
-                    raise RuntimeError(
-                        f"AI comparison could not repair Wiki step {repair_wiki_id} "
-                        "with exactly one correctly identified result."
+                try:
+                    batch_result = _comparison_batch_result(
+                        self.llm.generate(repair_request).content,
+                        batch_index,
                     )
-                retained_by_wiki[repair_wiki_id] = repair_result.matches[0]
-                batch_result = AIComparisonResult(
-                    summary=batch_result.summary,
-                    matches=[
-                        retained_by_wiki[step["id"]]
-                        for step in wiki_batch
-                        if step["id"] in retained_by_wiki
-                    ],
+                except RuntimeError as error:
+                    if not _is_output_limit_error(error) or len(wiki_batch_steps) == 1:
+                        raise
+                    split_at = len(wiki_batch_steps) // 2
+                    pending_batches = [
+                        wiki_batch_steps[:split_at],
+                        wiki_batch_steps[split_at:],
+                        *pending_batches,
+                    ]
+                    split_after_repair_limit = True
+                    if self.progress is not None:
+                        self.progress(
+                            f"Repair response for batch {batch_index} exceeded the "
+                            "AI output limit; splitting the Wiki actions and retrying..."
+                        )
+                    break
+                batch_result = _resolve_bash_candidate_ids(
+                    batch_result,
+                    candidate_to_source,
                 )
-                repaired_wiki_ids.add(repair_wiki_id)
+
+            if split_after_repair_limit:
+                continue
 
             batch_wiki_ids: set[str] = set()
             for match in batch_result.matches:
@@ -541,7 +1186,7 @@ class BuildPipeline:
                         )
                     if (
                         bash_id in used_bash_ids
-                        and not _is_reusable_parameterized_step(bash_by_id[bash_id])
+                        and not _is_reusable_comparison_step(bash_by_id[bash_id])
                     ):
                         raise RuntimeError(
                             f"AI comparison reused Bash step {bash_id}"
@@ -556,6 +1201,7 @@ class BuildPipeline:
                     "AI comparison omitted Wiki steps in batch "
                     f"{batch_index}: {', '.join(sorted(missing_wiki_ids))}"
                 )
+            completed_batches += 1
 
         all_matches = [matches_by_wiki[step.id] for step in wiki.steps]
         all_matches.extend(
@@ -638,7 +1284,7 @@ class BuildPipeline:
                     )
                 if (
                     bash_id in seen_bash
-                    and not _is_reusable_parameterized_step(bash_steps[bash_id])
+                    and not _is_reusable_comparison_step(bash_steps[bash_id])
                 ):
                     raise RuntimeError(
                         f"AI comparison reused Bash step {bash_id}"
@@ -668,14 +1314,38 @@ class BuildPipeline:
                 )
 
             automation_steps = [bash_steps[bash_id] for bash_id in bash_ids]
+            status = item.status
+            explanation = item.explanation
+            recommendation = item.recommendation
+            if status == MatchStatus.CONFLICT:
+                verified_differences = _verified_value_differences(
+                    item.value_differences,
+                    wiki_steps[item.wiki_step_id],
+                    set(bash_ids),
+                    bash_steps,
+                )
+                if not verified_differences:
+                    status = MatchStatus.MATCHED
+                    recommendation = None
+                    explanation = (
+                        "The AI linked this as the same build action but did not "
+                        "provide a verifiable source-value difference. BuildGuard "
+                        "does not report it as a confirmed conflict."
+                    )
+                else:
+                    evidence = "; ".join(
+                        f"{difference.field}: Wiki has {difference.wiki_value}, "
+                        f"Bash {difference.bash_step_id} has {difference.bash_value}"
+                        for difference in verified_differences
+                    )
+                    explanation = f"{explanation.strip()} Evidence: {evidence}."
             category = _normalized_discrepancy_category(
-                item.status,
+                status,
                 item.category,
                 wiki_steps.get(item.wiki_step_id) if item.wiki_step_id else None,
                 automation_steps,
             )
-            recommendation = item.recommendation
-            if item.status in {
+            if status in {
                 MatchStatus.MISSING,
                 MatchStatus.CONFLICT,
                 MatchStatus.EXTRA,
@@ -690,10 +1360,10 @@ class BuildPipeline:
                     wiki_step=(wiki_steps[item.wiki_step_id] if item.wiki_step_id else None),
                     automation_step=(automation_steps[0] if automation_steps else None),
                     automation_steps=automation_steps,
-                    status=item.status,
+                    status=status,
                     category=category,
                     recommendation=recommendation,
-                    explanation=item.explanation,
+                    explanation=explanation,
                 )
             )
 
@@ -897,7 +1567,7 @@ def _line_number(text: str, character_position: int) -> int:
 
 
 def _comparison_step(step: BuildStep) -> dict[str, Any]:
-    """Keep comparison-relevant fields while omitting duplicated source text."""
+    """Keep semantic fields plus only the source context not duplicated by them."""
     data = step.model_dump(
         mode="json",
         exclude_none=True,
@@ -916,9 +1586,21 @@ def _comparison_step(step: BuildStep) -> dict[str, Any]:
                 "conditions",
                 "runtime_options",
                 "runtime_defaults",
+                "context_labels",
             )
             if key in context and context[key] not in (None, [])
         }
+        context = data["context"]
+        source_type = step.context.source_type.casefold()
+        context_limits = (
+            {"surrounding_text": 600, "source_excerpt": 1200}
+            if source_type == "wiki"
+            else {"source_excerpt": 280}
+        )
+        for key, limit in context_limits.items():
+            value = step.context.model_dump(mode="json").get(key)
+            if isinstance(value, str) and value.strip():
+                context[key] = value[:limit]
     return data
 
 
@@ -961,7 +1643,19 @@ def _infer_conflict_category(
 
     wiki_packages = set(wiki_step.packages)
     bash_packages = {package for step in bash_steps for package in step.packages}
-    if wiki_packages and bash_packages and wiki_packages != bash_packages:
+    normalized_wiki_packages = {
+        package.lower() for package in wiki_packages
+    }
+    normalized_bash_packages = {
+        package.lower() for package in bash_packages
+    }
+    if normalized_wiki_packages and normalized_bash_packages and (
+        normalized_wiki_packages.isdisjoint(normalized_bash_packages)
+        or _versioned_package_disagreement(
+            normalized_wiki_packages,
+            normalized_bash_packages,
+        )
+    ):
         return DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
 
     value_fields = (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from app.models.build import BuildInstruction
 from app.models.context import SourceContext
 from app.models.report import (
@@ -40,10 +41,44 @@ def build_comparison_report(
         }:
             continue
 
-        wiki_evidence = _step_evidence(match.wiki_step) if match.wiki_step else None
         script_steps = _script_steps(match)
         category = _category(match)
         recommendation = match.recommendation or _recommendation(match.status, category)
+        wiki_evidence = _step_evidence(match.wiki_step) if match.wiki_step else None
+        script_evidence = [_step_evidence(step) for step in script_steps]
+        dependency_values = (
+            _dependency_mismatch_values(match.explanation)
+            if match.status == MatchStatus.CONFLICT
+            and category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+            else None
+        )
+        if dependency_values is not None and wiki_evidence is not None:
+            wiki_values, script_values = dependency_values
+            platform = _dependency_platform(match.wiki_step, script_steps)
+            wiki_evidence = _focused_dependency_evidence(
+                wiki_evidence,
+                f"Wiki specifies {', '.join(wiki_values)}{platform}.",
+                wiki_values,
+            )
+            relevant_script_steps = [
+                step for step in script_steps
+                if set(script_values)
+                & {package.lower() for package in step.packages}
+            ]
+            if relevant_script_steps:
+                script_evidence = [
+                    _focused_dependency_evidence(
+                        _step_evidence(step),
+                        f"Script installs {', '.join(script_values)}{platform}.",
+                        script_values,
+                    )
+                    for step in relevant_script_steps
+                ]
+            recommendation = (
+                f"Confirm whether {', '.join(wiki_values)} or "
+                f"{', '.join(script_values)} is intended{platform}, then update "
+                "the outdated source so the Wiki and script agree."
+            )
         discrepancies.append(
             Discrepancy(
                 id=f"D-{len(discrepancies) + 1:03d}",
@@ -53,7 +88,7 @@ def build_comparison_report(
                 explanation=match.explanation,
                 recommendation=recommendation,
                 wiki=wiki_evidence,
-                script=[_step_evidence(step) for step in script_steps],
+                script=script_evidence,
             )
         )
 
@@ -167,12 +202,11 @@ def _build_overview(
             f"Wiki build actions with {script_operations} script operations, "
             f"grouping related commands into semantic actions. "
             f"{semantic_matches} Wiki action{'' if semantic_matches == 1 else 's'} "
-            "matched the script; implementation details were not treated as findings."
+            "matched the script."
         )
     return (
-        f"All {wiki_actions} documented Wiki build actions matched the script or "
-        "were represented by harmless implementation details. No actionable "
-        "differences were found."
+        f"All {wiki_actions} documented Wiki build actions matched the script. "
+        "No actionable differences were found."
     )
 
 
@@ -183,6 +217,8 @@ def _finding_label(item: Discrepancy) -> str:
     if item.status == MatchStatus.EXTRA:
         return "Script action is not represented in the Wiki"
     if item.status == MatchStatus.CONFLICT:
+        if item.category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY:
+            return "Dependency versions differ"
         return "Wiki and script prescribe different behavior"
     if item.status == MatchStatus.UNUSED_CONFIGURATION:
         return "Configuration is defined but not used"
@@ -239,7 +275,92 @@ def _discrepancy_title(
             f"Unused configuration in Bash step {match.automation_step.id}: "
             f"{match.automation_step.description}"
         )
+    if (
+        match.status == MatchStatus.CONFLICT
+        and category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+    ):
+        values = _dependency_mismatch_values(match.explanation)
+        if values:
+            family = re.sub(r"\d.*$", "", values[0][0]).strip("-_")
+            if family:
+                return f"{family.capitalize()} version mismatch"
+        return "Dependency version mismatch"
     return _category_label(category)
+
+
+def _dependency_mismatch_values(
+    explanation: str,
+) -> tuple[list[str], list[str]] | None:
+    """Read the explicit package-value pair supplied by semantic matching."""
+    match = re.search(
+        r"The Wiki specifies (.+?), but the script installs ([^.]+)\.",
+        explanation,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    wiki_values = [value.strip().strip("`'") for value in match.group(1).split(",")]
+    script_values = [value.strip().strip("`'") for value in match.group(2).split(",")]
+    if not wiki_values or not script_values:
+        return None
+    return wiki_values, script_values
+
+
+def _dependency_platform(
+    wiki_step: BuildStep | None,
+    script_steps: list[BuildStep],
+) -> str:
+    if wiki_step is None:
+        return ""
+    text = " ".join(
+        value
+        for value in (
+            wiki_step.description,
+            wiki_step.context.source_excerpt,
+            wiki_step.context.surrounding_text,
+            " ".join(wiki_step.context.heading_path),
+            *(" ".join(step.commands) for step in script_steps),
+            *(step.context.surrounding_text for step in script_steps),
+        )
+        if value
+    ).lower()
+    for token, label in (
+        ("sles", " on SLES"),
+        ("zypper", " on SLES"),
+        ("opensuse", " on openSUSE"),
+        ("ubuntu", " on Ubuntu"),
+        ("rhel", " on RHEL"),
+        ("yum", " on RHEL"),
+        ("dnf", " on RHEL/Fedora"),
+        ("red hat", " on Red Hat"),
+        ("apt-get", " on Debian/Ubuntu"),
+        ("apt install", " on Debian/Ubuntu"),
+        ("debian", " on Debian"),
+    ):
+        if token in text:
+            return label
+    return ""
+
+
+def _focused_dependency_evidence(
+    evidence: StepEvidence,
+    description: str,
+    packages: list[str],
+) -> StepEvidence:
+    """Show only the dependency values involved in a version conflict."""
+    return evidence.model_copy(
+        update={
+            "description": description,
+            "commands": evidence.commands
+            or [f"Required package: {', '.join(packages)}"],
+            "packages": packages,
+            "paths": [],
+            "urls": [],
+            "dependencies": [],
+            "conditions": [],
+            "source_excerpt": None,
+        }
+    )
 
 
 def _script_steps(match: StepMatch) -> list[BuildStep]:
@@ -338,12 +459,10 @@ def _render_markdown(report: ComparisonReport) -> str:
             f"| **Actionable findings** | **{report.counts.findings}** | Items that need a person to review |",
             f"| Semantic matches | {report.counts.semantic_matches} | Wiki actions implemented by one or more related script commands |",
             f"| Unused configuration | {report.counts.unused_configuration} | Values defined in the script but not referenced |",
-            f"| Implementation details ignored | {report.counts.implementation_details_ignored} | Internal setup, cleanup, or helper commands not shown as problems |",
             "",
             "### How to read this",
             "",
             "- A **semantic match** means the Wiki describes one build action and the script may implement it with several commands, variables, or functions.",
-            "- **Implementation details** are shown as ignored because they help automation but do not normally need to be documented as user-facing build steps.",
             "- **Actionable findings** are the only items listed below. They represent a possible missing instruction, disagreement, undocumented behavior, or unused configuration.",
             "",
             "### Comparison scope",
@@ -411,45 +530,34 @@ def _render_markdown(report: ComparisonReport) -> str:
 
 
 def _render_evidence_markdown(evidence: StepEvidence) -> list[str]:
-    lines = [
-        f"- Step: `{evidence.id}` — {_markdown_inline(evidence.description)}",
-        f"- Location: {_markdown_inline(evidence.location)}",
-        f"- Action: `{evidence.action.value}`",
-    ]
-    for label, values in (
-        ("Commands", evidence.commands),
-        ("Packages", evidence.packages),
-        ("Paths", evidence.paths),
-        ("URLs", evidence.urls),
-        ("Dependencies", evidence.dependencies),
-        ("Conditions", evidence.conditions),
-    ):
-        if values:
-            lines.append(f"- {label}: {_markdown_inline('; '.join(values))}")
-    for label, value in (
-        ("Repository", evidence.repository),
-        ("Ref", evidence.ref),
-        ("Commit", evidence.commit),
-        ("Version", evidence.version),
-        ("Docker image", evidence.docker_image),
-        ("Dockerfile", evidence.dockerfile),
-    ):
-        if value:
-            lines.append(f"- {label}: `{_markdown_inline(value)}`")
-    if evidence.build_args:
-        values = ", ".join(
-            f"{key}={value}" for key, value in evidence.build_args.items()
+    location = _evidence_line_label(evidence)
+    lines = [f"- {location}"] if location else []
+    commands = evidence.commands
+    if commands:
+        lines.extend(
+            [
+                "",
+                "  ```bash",
+                *[f"  {line}" for line in "\n".join(commands).splitlines()],
+                "  ```",
+            ]
         )
-        lines.append(f"- Build arguments: `{_markdown_inline(values)}`")
-    if evidence.environment:
-        values = ", ".join(
-            f"{key}={value}" for key, value in evidence.environment.items()
-        )
-        lines.append(f"- Environment: `{_markdown_inline(values)}`")
-    if evidence.source_excerpt:
-        excerpt = _truncate(evidence.source_excerpt)
-        lines.extend(["", "  ```text", *[f"  {line}" for line in excerpt.splitlines()], "  ```"])
     return lines
+
+
+def _evidence_line_label(evidence: StepEvidence) -> str:
+    if evidence.line_start is not None:
+        end = evidence.line_end or evidence.line_start
+        return (
+            f"Line {evidence.line_start}"
+            if end == evidence.line_start
+            else f"Lines {evidence.line_start}–{end}"
+        )
+    match = re.search(r"\blines?\s+(\d+)(?:\s*[-–]\s*(\d+))?", evidence.location, re.I)
+    if match:
+        start, end = match.groups()
+        return f"Line {start}" if not end or end == start else f"Lines {start}–{end}"
+    return ""
 
 
 def _markdown_source(label: str, source: ReportSource) -> str:
@@ -488,12 +596,6 @@ def _render_html(report: ComparisonReport) -> str:
                 "Defined values that are not referenced",
                 "warning" if report.counts.unused_configuration else "muted",
             ),
-            (
-                "Implementation details ignored",
-                report.counts.implementation_details_ignored,
-                "Internal helper and cleanup commands",
-                "muted",
-            ),
         )
     )
     summary_rows = [
@@ -503,7 +605,6 @@ def _render_html(report: ComparisonReport) -> str:
         ("Script actions not in Wiki", report.counts.undocumented_script_steps),
         ("Wiki/script conflicts", report.counts.conflicting_steps),
         ("Unused configuration", report.counts.unused_configuration),
-        ("Implementation details ignored", report.counts.implementation_details_ignored),
     ]
     if report.counts.out_of_scope_steps:
         summary_rows.append(
@@ -615,50 +716,12 @@ def _discrepancy_html(item: Discrepancy) -> str:
 
 def _evidence_html(heading: str, evidence: StepEvidence) -> str:
     esc = html.escape
-    fields: list[tuple[str, str]] = [
-        ("Step", f"{evidence.id}: {evidence.description}"),
-        ("Location", evidence.location),
-        ("Action", evidence.action.value),
-    ]
-    for label, values in (
-        ("Commands", evidence.commands),
-        ("Packages", evidence.packages),
-        ("Paths", evidence.paths),
-        ("URLs", evidence.urls),
-        ("Dependencies", evidence.dependencies),
-        ("Conditions", evidence.conditions),
-    ):
-        if values:
-            fields.append((label, "; ".join(values)))
-    for label, value in (
-        ("Repository", evidence.repository),
-        ("Ref", evidence.ref),
-        ("Commit", evidence.commit),
-        ("Version", evidence.version),
-        ("Docker image", evidence.docker_image),
-        ("Dockerfile", evidence.dockerfile),
-    ):
-        if value:
-            fields.append((label, value))
-    if evidence.build_args:
-        fields.append(
-            ("Build arguments", ", ".join(f"{key}={value}" for key, value in evidence.build_args.items()))
-        )
-    if evidence.environment:
-        fields.append(
-            ("Environment", ", ".join(f"{key}={value}" for key, value in evidence.environment.items()))
-        )
     heading_html = f"<h4>{esc(heading)}</h4>" if heading else ""
-    fields_html = "".join(
-        f"<li><strong>{esc(label)}:</strong> {esc(value)}</li>"
-        for label, value in fields
-    )
-    excerpt_html = (
-        f"<pre>{esc(_truncate(evidence.source_excerpt))}</pre>"
-        if evidence.source_excerpt
-        else ""
-    )
-    return f'<div class="evidence">{heading_html}<ul>{fields_html}</ul>{excerpt_html}</div>'
+    line_label = _evidence_line_label(evidence)
+    line_html = f"<p><strong>{esc(line_label)}</strong></p>" if line_label else ""
+    commands = evidence.commands
+    command_html = f"<pre>{esc(chr(10).join(commands))}</pre>" if commands else ""
+    return f'<div class="evidence">{heading_html}{line_html}{command_html}</div>'
 
 
 def _summary_card(

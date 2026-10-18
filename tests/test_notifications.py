@@ -1,4 +1,5 @@
 from email.message import EmailMessage
+import re
 
 from app.models.report import ComparisonCounts, ComparisonReport
 from app.notifications import _build_report_notification_message
@@ -34,14 +35,19 @@ def test_notification_contains_plain_text_and_html_parts() -> None:
     )
 
     assert isinstance(message, EmailMessage)
-    assert message["Subject"] == "BuildGuard · Alfresco 25.3.0 · No issues found"
+    assert re.fullmatch(
+        r"BuildGuard · Alfresco 25\.3\.0 · No issues found · "
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .+",
+        message["Subject"],
+    )
     assert message.get_body(preferencelist=("plain",)).get_content().startswith(
         "BuildGuard review: Alfresco 25.3.0"
     )
     html = message.get_body(preferencelist=("html",)).get_content()
-    assert "Everything matched for this revision" in html
+    assert "No actionable findings" in html
     assert 'align="center"' in html
     assert "30" in html
     assert "No actionable findings were found" in message.get_body(
         preferencelist=("plain",)
     ).get_content()
+    assert "Sent:" in message.get_body(preferencelist=("plain",)).get_content()

@@ -1,25 +1,34 @@
 You are proposing a narrowly scoped correction to an automated Bash build script.
 
 Use only the supplied original script and BuildGuard findings. Return one JSON
-object matching the supplied ScriptFixProposal schema exactly.
+object matching the supplied ScriptFixPlan schema exactly.
 
 Rules:
-- Return the complete corrected Bash script in `fixed_script`, not a patch and not
-  a code fence.
-- Preserve the original script's shebang, functions, variables, comments, order,
-  supported platforms, versions, commits, and behavior unless a supplied finding
-  requires a specific correction.
-- Make the smallest safe changes needed to address the actionable findings.
-- Preserve indentation, line endings, and the final newline exactly unless the
-  finding itself requires changing that line. Do not reformat or reindent any
-  unrelated code.
-- Do not remove or rewrite unrelated build operations.
+- Return only source-linked edits in `edits`. Each edit must contain the finding
+  ID, an inclusive original-script line range, the exact original text being
+  replaced in `original_text`, and its replacement text. Do not return a complete
+  script and do not return a code fence.
+- Use the smallest possible line range. Prefer replacing one command or one
+  directly related command block rather than surrounding functions or the whole
+  file.
+- Copy `original_text` exactly from the supplied script, including command
+  continuation lines and indentation. The application uses it as an exact patch
+  anchor; do not summarize or reconstruct it.
+- Every edit must be inside the Bash line range shown in that finding's `script`
+  evidence. For a value mismatch, the evidence may show a command using a
+  variable whose definition appears earlier in the supplied script. In that
+  case, you may edit the exact assignment line for a variable named in the
+  evidence `environment`, using its actual source line and exact original text.
+  Do not edit any other lines. If a finding has no script evidence, do not
+  invent an edit for it.
+- The application will apply your edits to the original script. You must not
+  reproduce or reformat any unrelated lines.
 - Do not invent commands, versions, URLs, commits, packages, or configuration.
 - An undocumented operation should be changed only when the Wiki evidence in the
   finding supports the correction. If the evidence is insufficient, leave the
   code unchanged and explain that in `rationale`.
 - Unused configuration should be removed only when the finding identifies it and
   removing it cannot affect the documented build flow.
-- `affected_finding_ids` must contain only finding IDs actually addressed by the
-  proposed script.
+- `affected_finding_ids` must exactly match the finding IDs referenced by your
+  edits. Use an empty list when no safe edit can be proposed.
 - The proposal will be shown to a human for review before any GitHub write.

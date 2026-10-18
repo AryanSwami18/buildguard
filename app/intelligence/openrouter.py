@@ -41,11 +41,12 @@ class OpenRouterProvider:
         self.max_tokens = max_tokens
 
     def generate(self, request: LLMRequest) -> LLMResponse:
+        output_tokens = request.max_output_tokens or self.max_tokens
         system_prompt = request.system_prompt
         if request.structured_output_instructions:
             system_prompt = f"{system_prompt}\n\n{request.structured_output_instructions}"
         payload = {
-            "max_tokens": self.max_tokens,
+            "max_tokens": output_tokens,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.user_prompt},
@@ -77,9 +78,14 @@ class OpenRouterProvider:
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError("OpenRouter returned no chat-completion content") from error
         if choice.get("finish_reason") == "length":
+            limit_hint = (
+                "increase the comparison output budget"
+                if request.max_output_tokens is not None
+                else "increase OPENROUTER_MAX_TOKENS"
+            )
             raise RuntimeError(
                 "OpenRouter response exceeded the completion limit "
-                f"({self.max_tokens} tokens); increase OPENROUTER_MAX_TOKENS"
+                f"({output_tokens} tokens); {limit_hint}"
             )
         normalized_content = _message_content_text(content)
         if not normalized_content:

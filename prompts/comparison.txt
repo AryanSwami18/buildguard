@@ -37,10 +37,29 @@ For every missing, conflict, or extra entry, also provide:
 For matched and out_of_scope entries, use null for `category` and
 `recommendation`.
 
+For every `conflict`, `value_differences` is required and must identify the
+specific source evidence that proves the disagreement. Each item must contain:
+- `field`: the BuildStep field being compared (for example `version`, `commit`,
+  `repository`, `packages`, `commands`, `environment`, `docker_image`, or
+  `conditions`).
+- `wiki_value`: the exact value from the selected Wiki step.
+- `bash_step_id`: the selected Bash step that contains the conflicting value.
+- `bash_value`: the exact value from that Bash step.
+Use resolved values only when the supplied environment/default data proves the
+resolution. Do not compare values merely because they occur somewhere in the
+same function, file, or grouped workflow. Compare versions, commits, images,
+repositories, and packages only when they belong to the same component or
+configuration variable. If a concrete disagreement cannot be cited this way,
+do not label it a conflict. For non-conflicts, return an empty
+`value_differences` array.
+
 For a missing step, use null for `bash_step_id` and an empty `bash_step_ids`
-array. Use the same empty Bash fields for an out_of_scope step. A parameterized Bash step may support multiple Wiki variants when its
-variables or conditions explicitly allow those values; it may be referenced by
-more than one Wiki entry in that case. Do not reuse other Bash IDs. For each Bash
+array. Use the same empty Bash fields for an out_of_scope step. A parameterized
+Bash step may support multiple Wiki variants when its variables or conditions
+explicitly allow those values; it may be referenced by more than one Wiki entry
+in that case. A configuration-only `set_variable` step may also be referenced
+by multiple related Wiki entries as supporting evidence because it is not a
+standalone build action. Do not reuse other executable Bash IDs. For each Bash
 step not referenced by any Wiki entry, return one extra entry. Preserve all IDs
 exactly as supplied.
 
@@ -55,14 +74,15 @@ Accuracy rules:
 - Follow Bash variables, explicit defaults, conditions, and function context
   before deciding that an operation or value is absent.
 - Use any `runtime_options` and `runtime_defaults` in Bash context as source
-  evidence for parameterized Java operations. A listed Java choice proves the
-  script accepts that choice, but verify that its implementation supports the
-  Wiki's requested distribution and installation method too. The default is
-  the selection used when the user does not override it.
+  evidence for parameterized operations, regardless of package or runtime.
+  Confirm that the selected option is actually implemented by the relevant
+  commands; an option list alone does not prove that every operation supports
+  every option. A default is used only when the user does not override it.
 - A configurable value such as `${jver}` is not a conflict merely because it is
   written as a variable. Resolve an explicit default where available. If the
-  script explicitly supports the Wiki value as an option, treat that Wiki
-  variant as implemented even when another option is the default.
+  script explicitly supports the Wiki value as an option and the relevant
+  operation handles it, treat that Wiki variant as implemented even when
+  another option is the default.
 - Mark a step missing only after checking all Bash steps for equivalent
   commands, helper functions, and multi-command implementations.
 - Mark a Bash step extra only when it is an undocumented build operation or
@@ -73,5 +93,8 @@ Accuracy rules:
   explanation instead of describing it as an unconditional difference.
 
 Return only valid JSON matching the supplied expected_output schema. The summary
-should state the overall comparison result briefly. Each entry explanation
-should name the meaningful agreement or discrepancy, and must not invent facts.
+should state the overall comparison result briefly. Each conflict explanation
+must state the concrete values and why they affect the same build action. Each
+other explanation should name the meaningful agreement or discrepancy without
+inventing facts. Do not return a generic conflict explanation such as "a version
+or repository differs" without identifying the values.

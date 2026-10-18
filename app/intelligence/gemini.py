@@ -45,6 +45,7 @@ class GeminiProvider:
         self.max_output_tokens = max_output_tokens
 
     def generate(self, request: LLMRequest) -> LLMResponse:
+        output_tokens = request.max_output_tokens or self.max_output_tokens
         system_prompt = request.system_prompt
         if request.structured_output_instructions:
             system_prompt = (
@@ -54,7 +55,7 @@ class GeminiProvider:
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": request.user_prompt}]}],
             "generationConfig": {
-                "maxOutputTokens": self.max_output_tokens,
+                "maxOutputTokens": output_tokens,
                 "responseMimeType": "application/json",
             },
         }
@@ -73,7 +74,7 @@ class GeminiProvider:
                     delay = TRANSIENT_RETRY_DELAYS_SECONDS[attempt]
                 time.sleep(min(max(delay, 0.0), MAX_RETRY_AFTER_SECONDS))
             else:
-                content = self._generated_text(raw_response)
+                content = self._generated_text(raw_response, request.max_output_tokens)
                 try:
                     json.loads(content)
                 except json.JSONDecodeError as error:
@@ -98,7 +99,11 @@ class GeminiProvider:
 
         raise RuntimeError("Gemini request failed without a response")
 
-    def _generated_text(self, raw_response: dict[str, Any]) -> str:
+    def _generated_text(
+        self,
+        raw_response: dict[str, Any],
+        output_tokens: int | None = None,
+    ) -> str:
         try:
             candidate = raw_response["candidates"][0]
         except (KeyError, IndexError, TypeError) as error:
@@ -114,9 +119,15 @@ class GeminiProvider:
 
         finish_reason = candidate.get("finishReason")
         if finish_reason == "MAX_TOKENS":
+            limit = output_tokens or self.max_output_tokens
+            limit_hint = (
+                "increase the comparison output budget"
+                if output_tokens is not None
+                else "increase GEMINI_MAX_OUTPUT_TOKENS"
+            )
             raise RuntimeError(
                 "Gemini response exceeded the output limit "
-                f"({self.max_output_tokens} tokens); increase GEMINI_MAX_OUTPUT_TOKENS"
+                f"({limit} tokens); {limit_hint}"
             )
         if finish_reason and finish_reason not in {
             "STOP",

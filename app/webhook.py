@@ -32,6 +32,7 @@ class WebhookTarget:
     version: str | None
     refresh_wiki: bool
     refresh_bash: bool
+    trigger_id: str | None = None
 
 
 def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
@@ -62,12 +63,29 @@ class WebhookProcessor:
 
     def submit_event(self, event: str, payload: dict[str, Any]) -> int:
         targets = _webhook_targets(event, payload, self.settings)
+        LOGGER.info(
+            "Accepted GitHub %s event for %s; affected targets=%d trigger=%s",
+            event,
+            (payload.get("repository") or {}).get("full_name", "unknown repository"),
+            len(targets),
+            _event_trigger_id(event, payload) or "none",
+        )
         for target in targets:
             job = self.cache.enqueue_webhook_job(
                 package=target.package,
                 version=target.version,
                 refresh_wiki=target.refresh_wiki,
                 refresh_bash=target.refresh_bash,
+                trigger_id=target.trigger_id,
+            )
+            LOGGER.info(
+                "Queued BuildGuard webhook job %s for %s %s (wiki=%s bash=%s trigger=%s)",
+                job.job_id,
+                target.package,
+                target.version or "latest",
+                target.refresh_wiki,
+                target.refresh_bash,
+                target.trigger_id or "none",
             )
             self._schedule(job)
         return len(targets)
@@ -97,6 +115,13 @@ class WebhookProcessor:
                 if job is None:
                     return
                 try:
+                    LOGGER.info(
+                        "Starting BuildGuard webhook job %s for %s %s (trigger=%s)",
+                        job.job_id,
+                        job.package,
+                        job.version or "latest",
+                        job.trigger_id or "none",
+                    )
                     outcome = run_automated_package_review(
                         job.package,
                         self.settings,
@@ -109,6 +134,8 @@ class WebhookProcessor:
                         version=job.version,
                         refresh_wiki=job.refresh_wiki,
                         refresh_bash=job.refresh_bash,
+                        trigger_id=job.trigger_id,
+                        force_comparison=bool(job.trigger_id),
                     )
                     pending = self.cache.finish_webhook_job(
                         job.job_id,
@@ -131,6 +158,14 @@ class WebhookProcessor:
                         and job.attempts < 3
                     ):
                         time.sleep(min(2 ** job.attempts, 8))
+                    else:
+                        LOGGER.info(
+                            "Finished BuildGuard webhook job %s for %s %s: %s",
+                            job.job_id,
+                            job.package,
+                            job.version or "latest",
+                            outcome.status,
+                        )
                 except Exception as error:
                     LOGGER.exception(
                         "Unable to process BuildGuard webhook job for %s",
@@ -191,6 +226,8 @@ def _webhook_targets(
     if not isinstance(repository_name, str):
         return set()
 
+    trigger_id = _event_trigger_id(event, payload)
+
     if event == "gollum" and repository_name == settings.github_repo:
         jobs: set[WebhookTarget] = set()
         for page in payload.get("pages") or []:
@@ -206,6 +243,7 @@ def _webhook_targets(
                         None,
                         True,
                         False,
+                        trigger_id,
                     )
                 )
         return jobs
@@ -224,6 +262,7 @@ def _webhook_targets(
                 None,
                 True,
                 False,
+                trigger_id,
             )
             for path in map(PurePosixPath, changed_paths)
             if path.suffix.casefold() == ".md"
@@ -246,11 +285,40 @@ def _webhook_targets(
                         parts[1],
                         False,
                         True,
+                        trigger_id,
                     )
                 )
         return jobs
 
     return set()
+
+
+def _event_trigger_id(event: str, payload: dict[str, Any]) -> str | None:
+    """Return a stable identifier for one GitHub source-change event."""
+    if event == "push":
+        value = payload.get("after")
+        if isinstance(value, str) and value:
+            return f"push:{value}"
+        head_commit = payload.get("head_commit") or {}
+        if isinstance(head_commit, dict):
+            value = head_commit.get("id")
+            if isinstance(value, str) and value:
+                return f"push:{value}"
+    if event == "gollum":
+        pages = payload.get("pages") or []
+        page_revisions = sorted(
+            (page.get("page_name"), page.get("sha"))
+            for page in pages
+            if isinstance(page, dict)
+            and isinstance(page.get("page_name"), str)
+            and isinstance(page.get("sha"), str)
+        )
+        if page_revisions:
+            digest = hashlib.sha256(
+                json.dumps(page_revisions, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            return f"gollum:{digest}"
+    return None
 
 
 def _push_matches_branch(
@@ -260,7 +328,13 @@ def _push_matches_branch(
 ) -> bool:
     ref = payload.get("ref")
     configured = settings.scripts_branch if repository_name == settings.scripts_repo else settings.github_branch
-    if not isinstance(ref, str) or configured == "HEAD":
+    if not isinstance(ref, str):
+        return True
+    if configured == "HEAD":
+        repository = payload.get("repository") or {}
+        default_branch = repository.get("default_branch")
+        if isinstance(default_branch, str) and default_branch:
+            return ref == f"refs/heads/{default_branch}"
         return True
     return ref == f"refs/heads/{configured}"
 

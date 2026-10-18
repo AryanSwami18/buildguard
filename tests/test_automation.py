@@ -7,7 +7,12 @@ from app.models.report import (
 from app.models.repair import ScriptFixProposal
 from app.models.step import ActionType
 from app.models.validation import DiscrepancyCategory, MatchStatus
-from app.service import ComparisonRun, _comparison_run_key, run_automated_package_review
+from app.service import (
+    ComparisonRun,
+    _automation_run_key,
+    _comparison_run_key,
+    run_automated_package_review,
+)
 from app.storage.repository import ComparisonCacheKey, ParsedSourceRepository
 from app.config.settings import Settings
 
@@ -120,6 +125,168 @@ def test_automation_emails_a_clean_report(tmp_path, monkeypatch) -> None:
     assert notifications == [report]
     automation_run = repository.get_automation_run(_comparison_run_key(key))
     assert automation_run.status == "notification_sent"
+    assert automation_run.notification_sent
+
+
+def test_webhook_trigger_forces_new_comparison_and_notification(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        buildguard_database_path=str(tmp_path / "buildguard.sqlite3"),
+        notification_email_to="owner@example.com",
+        smtp_host="smtp.example.com",
+        smtp_from="buildguard@example.com",
+    )
+    report = _report(findings=False)
+    key = _key()
+    repository = ParsedSourceRepository(settings.buildguard_database_path)
+    stored = repository.save_comparison_report(key, report)
+    old_run_key = _comparison_run_key(key)
+    repository.save_automation_run(
+        run_key=old_run_key,
+        package=report.package,
+        version=report.version or "unknown",
+        report_id=stored.report_id,
+        status="notification_sent",
+        notification_sent=True,
+    )
+
+    calls: list[bool] = []
+
+    def fresh_comparison(*args, **kwargs):
+        calls.append(kwargs["bypass_report_cache"])
+        return ComparisonRun(report, key, stored, False)
+
+    monkeypatch.setattr("app.service._run_package_comparison", fresh_comparison)
+    notifications: list[ComparisonReport] = []
+    monkeypatch.setattr(
+        "app.service.send_report_notification",
+        lambda _settings, notification_report, **_kwargs: notifications.append(
+            notification_report
+        ),
+    )
+
+    outcome = run_automated_package_review(
+        "Alfresco",
+        settings,
+        trigger_id="push:merge-commit",
+        force_comparison=True,
+    )
+
+    assert outcome.status == "complete"
+    assert calls == [True]
+    assert notifications == [report]
+    event_run = repository.get_automation_run(
+        _automation_run_key(key, "push:merge-commit")
+    )
+    assert event_run is not None
+    assert event_run.notification_sent
+    assert repository.get_automation_run(old_run_key).notification_sent
+
+
+def test_automation_does_not_email_findings_without_pr_link(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        buildguard_database_path=str(tmp_path / "buildguard.sqlite3"),
+        buildguard_auto_pr=True,
+        notification_email_to="owner@example.com",
+        smtp_host="smtp.example.com",
+        smtp_from="buildguard@example.com",
+    )
+    report = _report(findings=True)
+    key = _key()
+    repository = ParsedSourceRepository(settings.buildguard_database_path)
+    stored = repository.save_comparison_report(key, report)
+    monkeypatch.setattr(
+        "app.service._run_package_comparison",
+        lambda *args, **kwargs: ComparisonRun(report, key, stored, True),
+    )
+    monkeypatch.setattr(
+        "app.service.load_script_source_content",
+        lambda *args, **kwargs: "echo extra\n",
+    )
+    monkeypatch.setattr(
+        "app.service.propose_script_fix",
+        lambda *args, **kwargs: ScriptFixProposal(
+            fixed_script="echo fixed\n",
+            summary="Fix",
+            rationale="Fix",
+            affected_finding_ids=["D-001"],
+        ),
+    )
+    def fail_pr_creation(*args, **kwargs):
+        raise RuntimeError("PR creation failed")
+
+    monkeypatch.setattr(
+        "app.service.create_script_fix_pull_request",
+        fail_pr_creation,
+    )
+    notifications: list[ComparisonReport] = []
+    monkeypatch.setattr(
+        "app.service.send_report_notification",
+        lambda _settings, notification_report, **_kwargs: notifications.append(
+            notification_report
+        ),
+    )
+
+    outcome = run_automated_package_review("Alfresco", settings)
+
+    assert outcome.status == "followup_failed"
+    assert notifications == []
+    automation_run = repository.get_automation_run(_comparison_run_key(key))
+    assert automation_run.status == "pr_failed"
+    assert not automation_run.notification_sent
+
+
+def test_automation_emails_findings_with_created_pr_link(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        buildguard_database_path=str(tmp_path / "buildguard.sqlite3"),
+        buildguard_auto_pr=True,
+        notification_email_to="owner@example.com",
+        smtp_host="smtp.example.com",
+        smtp_from="buildguard@example.com",
+    )
+    report = _report(findings=True)
+    key = _key()
+    repository = ParsedSourceRepository(settings.buildguard_database_path)
+    stored = repository.save_comparison_report(key, report)
+    monkeypatch.setattr(
+        "app.service._run_package_comparison",
+        lambda *args, **kwargs: ComparisonRun(report, key, stored, True),
+    )
+    monkeypatch.setattr(
+        "app.service.load_script_source_content",
+        lambda *args, **kwargs: "echo extra\n",
+    )
+    monkeypatch.setattr(
+        "app.service.propose_script_fix",
+        lambda *args, **kwargs: ScriptFixProposal(
+            fixed_script="echo fixed\n",
+            summary="Fix",
+            rationale="Fix",
+            affected_finding_ids=["D-001"],
+        ),
+    )
+    pull_request_url = "https://github.com/example/scripts/pull/42"
+    monkeypatch.setattr(
+        "app.service.create_script_fix_pull_request",
+        lambda *args, **kwargs: {"html_url": pull_request_url},
+    )
+    notifications: list[tuple[ComparisonReport, str | None]] = []
+    monkeypatch.setattr(
+        "app.service.send_report_notification",
+        lambda _settings, notification_report, **kwargs: notifications.append(
+            (notification_report, kwargs["pr_url"])
+        ),
+    )
+
+    outcome = run_automated_package_review("Alfresco", settings)
+
+    assert outcome.status == "complete"
+    assert notifications == [(report, pull_request_url)]
+    automation_run = repository.get_automation_run(_comparison_run_key(key))
+    assert automation_run.status == "notification_sent"
+    assert automation_run.pr_url == pull_request_url
     assert automation_run.notification_sent
 
 

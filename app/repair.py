@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import difflib
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 from app.intelligence.interface import LLMProvider
 from app.intelligence.request import LLMRequest
-from app.models.repair import ScriptFixProposal
+from app.models.repair import ScriptFixEdit, ScriptFixPlan, ScriptFixProposal
 from app.models.report import ComparisonReport
 from app.parsers.bash_parser import parse_script
 
@@ -24,7 +25,7 @@ def generate_script_fix_proposal(
     original_script: str,
     progress: ProgressCallback | None = None,
 ) -> ScriptFixProposal:
-    """Ask the configured model for a minimal complete-script correction."""
+    """Ask the configured model for a minimal source-linked correction."""
     if not report.discrepancies:
         raise ValueError("A fix proposal can only be generated for actionable findings")
     if not original_script.strip():
@@ -50,14 +51,28 @@ def generate_script_fix_proposal(
                     finding.model_dump(mode="json", exclude_none=True)
                     for finding in report.discrepancies
                 ],
-                "expected_output": ScriptFixProposal.model_json_schema(),
+                "expected_output": ScriptFixPlan.model_json_schema(),
             },
             indent=2,
             ensure_ascii=False,
         ),
     )
     response = provider.generate(request).content
-    proposal = ScriptFixProposal.model_validate(_json_object(response))
+    response_data = _json_object(response)
+    if "edits" in response_data or "fixed_script" not in response_data:
+        try:
+            plan = ScriptFixPlan.model_validate(response_data)
+        except ValueError as error:
+            raise RuntimeError(
+                "AI returned an incomplete fix plan. The response must include "
+                "edits, summary, rationale, and affected_finding_ids."
+            ) from error
+        return _apply_fix_plan(plan, report, original_script)
+
+    # Accept the previous complete-script format for already configured/custom
+    # providers, but new requests use ScriptFixPlan so unrelated lines never
+    # depend on how accurately the model reproduces the whole file.
+    proposal = ScriptFixProposal.model_validate(response_data)
     proposal.fixed_script = _preserve_eof_style(
         _strip_code_fence(proposal.fixed_script),
         original_script,
@@ -143,6 +158,192 @@ def _assignment_name(line: str) -> str | None:
     return None
 
 
+def _variable_assignment_ranges(
+    original_script: str,
+    variable_names: set[str],
+) -> list[tuple[int, int]]:
+    """Find exact source lines defining variables cited by finding evidence.
+
+    Semantic comparison evidence often links the command that consumes a
+    variable rather than the earlier declaration that supplies its value. A
+    repair may safely update that declaration when the variable name is part
+    of the finding's structured evidence.
+    """
+    if not variable_names:
+        return []
+    assignment_pattern = re.compile(
+        r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*="
+    )
+    ranges: list[tuple[int, int]] = []
+    for line_number, line in enumerate(original_script.splitlines(), start=1):
+        match = assignment_pattern.match(line)
+        if match and match.group(1) in variable_names:
+            ranges.append((line_number, line_number))
+    return ranges
+
+
+def _finding_source_ranges(
+    finding: Any,
+    original_script: str,
+) -> list[tuple[int, int]]:
+    """Return direct evidence ranges plus referenced variable declarations."""
+    ranges: list[tuple[int, int]] = []
+    variable_names: set[str] = set()
+    for evidence in finding.script:
+        if evidence.line_start is not None and evidence.line_end is not None:
+            ranges.append((evidence.line_start, evidence.line_end))
+        variable_names.update(evidence.environment)
+    ranges.extend(_variable_assignment_ranges(original_script, variable_names))
+    return ranges
+
+
+def _apply_fix_plan(
+    plan: ScriptFixPlan,
+    report: ComparisonReport,
+    original_script: str,
+) -> ScriptFixProposal:
+    """Apply validated source-linked edits to the untouched original script."""
+    findings = {finding.id: finding for finding in report.discrepancies}
+    edit_ids = {edit.finding_id for edit in plan.edits}
+    declared_ids = set(plan.affected_finding_ids)
+    if declared_ids != edit_ids:
+        raise RuntimeError(
+            "The fix plan's affected findings do not match its edits. "
+            "Generate a plan with one finding ID per source-linked edit."
+        )
+
+    source_lines = original_script.splitlines(keepends=True)
+    if not source_lines:
+        raise RuntimeError("The build script is empty; a fix plan cannot be applied")
+
+    normalized_source = original_script.replace("\r\n", "\n").replace("\r", "\n")
+    line_ending = "\r\n" if "\r\n" in original_script else "\n"
+    resolved_edits: list[tuple[ScriptFixEdit, int, int, list[str]]] = []
+    for edit in plan.edits:
+        if edit.finding_id not in findings:
+            raise RuntimeError(
+                f"The fix plan references unknown finding ID: {edit.finding_id}"
+            )
+
+        finding = findings[edit.finding_id]
+        evidence_ranges = _finding_source_ranges(finding, original_script)
+        if not evidence_ranges:
+            raise RuntimeError(
+                f"Finding {edit.finding_id} has no source-linked Bash lines; "
+                "BuildGuard cannot safely create an edit for it."
+            )
+        original_text = edit.original_text.replace("\r\n", "\n").replace("\r", "\n")
+        if not original_text:
+            raise RuntimeError(
+                f"Edit for {edit.finding_id} has no original_text patch anchor."
+            )
+        occurrences: list[tuple[int, int, int]] = []
+        search_from = 0
+        while True:
+            match_start = normalized_source.find(original_text, search_from)
+            if match_start < 0:
+                break
+            match_end = match_start + len(original_text)
+            starts_at_line = match_start == 0 or normalized_source[match_start - 1] == "\n"
+            ends_at_line = (
+                match_end == len(normalized_source)
+                or normalized_source[match_end - 1] == "\n"
+                or normalized_source[match_end] == "\n"
+            )
+            if starts_at_line and ends_at_line:
+                actual_start = normalized_source.count("\n", 0, match_start) + 1
+                old_lines = normalized_source[match_start:match_end].splitlines()
+                actual_end = actual_start + max(1, len(old_lines)) - 1
+                if any(
+                    actual_start <= end and actual_end >= start
+                    for start, end in evidence_ranges
+                ):
+                    occurrences.append((match_start, actual_start, actual_end))
+            search_from = match_start + 1
+        if len(occurrences) != 1:
+            raise RuntimeError(
+                f"The original block for {edit.finding_id} was not found exactly "
+                f"once within its linked Bash evidence; found {len(occurrences)} matches."
+            )
+
+        match_start, actual_start, actual_end = occurrences[0]
+        match_end = match_start + len(original_text)
+
+        replacement_normalized = edit.replacement.replace("\r\n", "\n").replace("\r", "\n")
+        local_changes = _changed_line_ranges(original_text, replacement_normalized)
+        for old_start, old_end, _, _ in local_changes:
+            if old_start <= old_end:
+                changed_start = actual_start + old_start - 1
+                changed_end = actual_start + old_end - 1
+            else:
+                changed_start = changed_end = actual_start + old_start - 1
+            if not any(
+                changed_start <= end and changed_end >= start
+                for start, end in evidence_ranges
+            ):
+                raise RuntimeError(
+                    f"Edit for {edit.finding_id} changes lines "
+                    f"{changed_start}-{changed_end} outside its linked Bash evidence."
+                )
+
+        replacement_lines = _edit_replacement_lines(
+            edit.replacement,
+            line_ending,
+            actual_end,
+            len(source_lines),
+            original_script.endswith(("\n", "\r")),
+        )
+        resolved_edits.append((edit, actual_start, actual_end, replacement_lines))
+
+    ordered_edits = sorted(resolved_edits, key=lambda item: (item[1], item[2]))
+    previous_end = 0
+    for _, actual_start, actual_end, _ in ordered_edits:
+        if actual_start <= previous_end:
+            raise RuntimeError("The fix plan contains overlapping script edits")
+        previous_end = actual_end
+
+    fixed_lines = list(source_lines)
+    changed = False
+    for edit, actual_start, actual_end, replacement_lines in reversed(ordered_edits):
+        old_text = "".join(fixed_lines[actual_start - 1 : actual_end])
+        new_text = "".join(replacement_lines)
+        changed = changed or old_text != new_text
+        fixed_lines[actual_start - 1 : actual_end] = replacement_lines
+
+    if plan.edits and not changed:
+        raise RuntimeError("The fix plan does not change the original script")
+
+    fixed_script = _preserve_eof_style("".join(fixed_lines), original_script)
+    try:
+        parse_script(fixed_script)
+    except Exception as error:  # bashlex uses several exception types.
+        raise RuntimeError(f"The proposed script is not valid Bash syntax: {error}") from error
+    return ScriptFixProposal(
+        fixed_script=fixed_script,
+        summary=plan.summary,
+        rationale=plan.rationale,
+        affected_finding_ids=plan.affected_finding_ids,
+    )
+
+
+def _edit_replacement_lines(
+    replacement: str,
+    line_ending: str,
+    end_line: int,
+    source_line_count: int,
+    source_has_final_newline: bool,
+) -> list[str]:
+    """Normalize one model edit to the source file's line-ending convention."""
+    normalized = replacement.replace("\r\n", "\n").replace("\r", "\n")
+    if line_ending == "\r\n":
+        normalized = normalized.replace("\n", line_ending)
+    replacement_lines = normalized.splitlines(keepends=True)
+    if normalized and not normalized.endswith("\n"):
+        if end_line < source_line_count or source_has_final_newline:
+            replacement_lines.append(line_ending)
+    return replacement_lines
+
+
 def _preserve_eof_style(fixed_script: str, original_script: str) -> str:
     """Normalize model wrappers without changing the source's EOF convention."""
     if original_script.endswith(("\n", "\r")):
@@ -190,10 +391,7 @@ def _validate_proposal_scope(
             evidence.line_start is not None and evidence.line_end is not None
             for evidence in finding.script
         ):
-            allowed_ranges.extend(
-                (evidence.line_start, evidence.line_end)
-                for evidence in finding.script
-            )
+            allowed_ranges.extend(_finding_source_ranges(finding, original_script))
         else:
             unsupported_findings.append(finding.id)
 
@@ -202,6 +400,17 @@ def _validate_proposal_scope(
             "The proposal changes findings without source-linked script lines: "
             + ", ".join(unsupported_findings)
         )
+
+    # Models sometimes re-indent otherwise unchanged lines while reproducing a
+    # complete script.  Keep the source text for those harmless formatting
+    # changes so the proposal remains a minimal, reviewable edit.  Substantive
+    # edits outside a finding's source range are still rejected below.
+    proposal.fixed_script = _preserve_only_finding_changes(
+        original_script,
+        proposal.fixed_script,
+        allowed_ranges,
+    )
+    changes = _changed_line_ranges(original_script, proposal.fixed_script)
 
     def in_allowed_range(start: int, end: int) -> bool:
         # Insertions have start > end; anchor them to the preceding source line.
@@ -221,6 +430,91 @@ def _validate_proposal_scope(
             "The proposed fix changes unrelated script lines ("
             f"{rendered}). Generate a smaller finding-backed fix."
         )
+
+
+def _preserve_only_finding_changes(
+    original_script: str,
+    proposed_script: str,
+    allowed_ranges: list[tuple[int, int]],
+) -> str:
+    """Discard formatting-only model edits outside finding-linked lines.
+
+    The repair prompt asks the model to return a complete script.  Complete
+    script reproduction is useful for review, but models can change indentation
+    or whitespace on unrelated lines.  This function restores those lines from
+    the original source while leaving changes in allowed ranges untouched.
+    It deliberately raises for substantive out-of-scope edits.
+    """
+    original_lines = original_script.splitlines(keepends=True)
+    proposed_lines = proposed_script.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(
+        a=original_lines,
+        b=proposed_lines,
+        autojunk=False,
+    )
+
+    def allowed(line_number: int) -> bool:
+        return any(start <= line_number <= end for start, end in allowed_ranges)
+
+    def formatting_only(left: str, right: str) -> bool:
+        return left.rstrip("\r\n").strip() == right.rstrip("\r\n").strip()
+
+    def non_behavioral_log_line(line: str) -> bool:
+        """Identify a plain status message, not a build/configuration command."""
+        stripped = line.strip()
+        if not stripped or (stripped.startswith("#") and not stripped.startswith("#!")):
+            return True
+        if not (stripped.startswith("printf ") or stripped.startswith("echo ")):
+            return False
+        # A redirected message can write an environment/configuration file, so
+        # leave those lines under the normal strict scope validation. Piping a
+        # status message to tee is still logging, not a build/configuration
+        # operation.
+        if "|& tee" in stripped or "| tee" in stripped:
+            return True
+        return not any(operator in stripped for operator in (">", "|", "$(", "`"))
+
+    repaired: list[str] = []
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        old_block = original_lines[old_start:old_end]
+        new_block = proposed_lines[new_start:new_end]
+        if tag == "equal":
+            repaired.extend(old_block)
+            continue
+
+        if tag == "replace" and len(old_block) == len(new_block):
+            for offset, (old_line, new_line) in enumerate(zip(old_block, new_block)):
+                line_number = old_start + offset + 1
+                if allowed(line_number):
+                    repaired.append(new_line)
+                elif formatting_only(old_line, new_line) or non_behavioral_log_line(old_line):
+                    repaired.append(old_line)
+                else:
+                    raise RuntimeError(
+                        "The proposed fix changes unrelated script lines ("
+                        f"original lines {line_number}-{line_number}). Generate "
+                        "a smaller finding-backed fix."
+                    )
+            continue
+
+        anchor = old_start + 1 if old_start < old_end else max(1, old_start)
+        if any(allowed(old_start + offset + 1) for offset in range(len(old_block))):
+            repaired.extend(new_block)
+            continue
+
+        # Adding/removing blank lines is formatting-only.  Preserve the
+        # original block so the proposal cannot silently reorder source code.
+        if all(not line.rstrip("\r\n").strip() for line in old_block + new_block):
+            repaired.extend(old_block)
+            continue
+
+        raise RuntimeError(
+            "The proposed fix changes unrelated script lines ("
+            f"original lines {anchor}-{max(anchor, old_end)}). Generate a "
+            "smaller finding-backed fix."
+        )
+
+    return "".join(repaired)
 
 
 def _json_object(content: str) -> dict[str, Any]:

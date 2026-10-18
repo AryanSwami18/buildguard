@@ -278,12 +278,15 @@ class GitHubClient:
         """
         if not self.token:
             raise ValueError("GITHUB_TOKEN is required to create a pull request")
-        if base_branch == "HEAD":
-            raise ValueError(
-                "SCRIPTS_BRANCH must be a concrete branch name when creating a PR"
-            )
         if fixed_content == original_content:
             raise ValueError("The proposed script has no changes")
+
+        # ``HEAD`` is useful when reading a repository because GitHub treats it
+        # as "the repository's default branch" when the ref is omitted.  A PR,
+        # however, needs the actual branch name in its base field. Resolve the
+        # alias against the repository receiving the PR before any branch,
+        # file, or pull-request operations are performed.
+        base_branch = self._resolve_pr_base_branch(repository, base_branch)
 
         head_repository = head_repository or repository
         branch = branch_name or self._fix_branch_name(path)
@@ -454,6 +457,31 @@ class GitHubClient:
         # `master` for a Wiki).
         ref_query = "" if ref == "HEAD" else f"?ref={quote(ref, safe='')}"
         return f"{self.api_base_url}/repos/{repository_path}/contents{suffix}{ref_query}"
+
+    def _repository_url(self, repository: str) -> str:
+        repository_path = quote(repository, safe="/")
+        return f"{self.api_base_url}/repos/{repository_path}"
+
+    def _resolve_pr_base_branch(self, repository: str, base_branch: str) -> str:
+        """Return a concrete PR base branch for a repository.
+
+        Source settings commonly use ``HEAD`` so cache provenance follows the
+        repository default branch. GitHub's pull-request API does not accept
+        that alias as the ``base`` value, so resolve it through repository
+        metadata only at PR creation time. Explicit branch names remain
+        untouched.
+        """
+        candidate = (base_branch or "").strip()
+        if candidate and candidate.casefold() != "head":
+            return candidate
+
+        payload = self._get_json(self._repository_url(repository))
+        default_branch = payload.get("default_branch") if isinstance(payload, dict) else None
+        if not isinstance(default_branch, str) or not default_branch.strip():
+            raise RuntimeError(
+                f"GitHub did not return a default branch for repository '{repository}'"
+            )
+        return default_branch.strip()
 
     def _git_ref_url(self, repository: str, branch: str) -> str:
         repository_path = quote(repository, safe="/")

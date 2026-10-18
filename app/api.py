@@ -32,6 +32,7 @@ from app.webhook import WebhookProcessor
 
 class PackageComparisonRequest(BaseModel):
     package: str
+    force_comparison: bool = False
 
 
 class ScriptSourceRequest(BaseModel):
@@ -126,7 +127,11 @@ def compare(
     request: Request,
 ) -> ComparisonReport:
     try:
-        return run_package_comparison(payload.package, _require_internal_api(request))
+        return run_package_comparison(
+            payload.package,
+            _require_internal_api(request),
+            force_comparison=payload.force_comparison,
+        )
     except (ValueError, RuntimeError, OSError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
@@ -141,6 +146,7 @@ def create_comparison_job(
         job_id = start_package_comparison(
             payload.package,
             _require_internal_api(request),
+            force_comparison=payload.force_comparison,
         )
         return {"job_id": job_id}
     except (ValueError, RuntimeError, OSError) as error:

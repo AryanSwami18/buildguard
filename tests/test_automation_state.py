@@ -92,7 +92,7 @@ def test_webhook_processor_schedules_versioned_work(monkeypatch, tmp_path) -> No
         buildguard_database_path=str(tmp_path / "buildguard.sqlite3"),
     )
     completed = Event()
-    calls: list[tuple[str, str | None, bool, bool]] = []
+    calls: list[tuple[str, str | None, bool, bool, str | None, bool]] = []
 
     def fake_review(package, settings, progress=None, **kwargs):
         calls.append(
@@ -101,6 +101,8 @@ def test_webhook_processor_schedules_versioned_work(monkeypatch, tmp_path) -> No
                 kwargs["version"],
                 kwargs["refresh_wiki"],
                 kwargs["refresh_bash"],
+                kwargs["trigger_id"],
+                kwargs["force_comparison"],
             )
         )
         completed.set()
@@ -114,11 +116,42 @@ def test_webhook_processor_schedules_versioned_work(monkeypatch, tmp_path) -> No
             {
                 "repository": {"full_name": "example/scripts"},
                 "ref": "refs/heads/master",
+                "after": "commit-1",
                 "commits": [{"added": ["Alfresco/26.0.0/build_alfresco.sh"]}],
             },
         )
         assert accepted == 1
         assert completed.wait(timeout=2)
-        assert calls == [("Alfresco", "26.0.0", False, True)]
+        assert calls == [
+            ("Alfresco", "26.0.0", False, True, "push:commit-1", True)
+        ]
+        job = processor.cache.get_webhook_job(1)
+        assert job is not None
+        assert job.trigger_id == "push:commit-1"
     finally:
         processor.executor.shutdown(wait=True)
+
+
+def test_same_webhook_delivery_is_not_queued_twice(tmp_path) -> None:
+    repository = ParsedSourceRepository(tmp_path / "buildguard.sqlite3")
+    first = repository.enqueue_webhook_job(
+        package="Alfresco",
+        version="26.0.0",
+        refresh_wiki=False,
+        refresh_bash=True,
+        trigger_id="push:commit-1",
+    )
+    claimed = repository.claim_webhook_job(first.job_id)
+    assert claimed is not None
+    assert repository.finish_webhook_job(first.job_id, status="complete") is False
+
+    duplicate = repository.enqueue_webhook_job(
+        package="Alfresco",
+        version="26.0.0",
+        refresh_wiki=False,
+        refresh_bash=True,
+        trigger_id="push:commit-1",
+    )
+
+    assert duplicate.job_id == first.job_id
+    assert duplicate.status == "complete"

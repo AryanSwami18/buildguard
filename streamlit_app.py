@@ -14,6 +14,7 @@ from app.models.report import ComparisonReport
 from app.models.repair import ScriptFixProposal
 from app.reporting.code_view import annotations_by_line
 from app.reporting.reporter import render_report
+from app.time_utils import local_timestamp
 
 
 st.set_page_config(
@@ -225,11 +226,24 @@ def _open_saved_report(entry: dict[str, object]) -> None:
     except ValueError as error:
         st.error(f"The saved report could not be opened: {error}")
         return
+    if "buildguard_saved_report_background_saved" not in st.session_state:
+        st.session_state["buildguard_saved_report_background_saved"] = True
+        st.session_state["buildguard_report_before_saved_view"] = st.session_state.get(
+            "buildguard_report"
+        )
+        st.session_state["buildguard_package_before_saved_view"] = st.session_state.get(
+            "buildguard_report_package"
+        )
     st.session_state["buildguard_report"] = report.model_dump(mode="json")
     st.session_state["buildguard_report_package"] = report.package.strip().casefold()
     st.session_state["buildguard_opened_report_id"] = entry.get("id")
-    st.session_state.pop("buildguard_comparison_job_id", None)
-    st.session_state.pop("buildguard_comparison_package", None)
+
+
+def _saved_report_timestamp(value: object) -> str:
+    """Display the UTC database timestamp in the local timezone."""
+    if not isinstance(value, str) or not value:
+        return "time unavailable"
+    return local_timestamp(value)
 
 
 _inject_styles()
@@ -283,8 +297,7 @@ with st.sidebar:
                 for entry in entries:
                     version = str(entry.get("version") or "")
                     findings = entry.get("findings", 0)
-                    updated_at = str(entry.get("updated_at") or "")
-                    updated_label = updated_at.replace("T", " ")[:16]
+                    updated_label = _saved_report_timestamp(entry.get("updated_at"))
                     label = (
                         f"{version or 'Unversioned'} · {findings} finding"
                         f"{'s' if findings != 1 else ''} · {updated_label}"
@@ -335,8 +348,7 @@ def _render_findings_overview(report: ComparisonReport) -> None:
     if not report.discrepancies:
         st.success(
             "Nothing needs attention. The documented build actions are represented "
-            "by the script, and internal implementation details were not counted "
-            "as discrepancies."
+            "by the script."
         )
         return
 
@@ -346,7 +358,7 @@ def _render_findings_overview(report: ComparisonReport) -> None:
         "Wiki says, what the script does, and the recommended next step."
     )
     for item in report.discrepancies:
-        label = _streamlit_finding_label(item.status.value)
+        label = _streamlit_finding_label(item.status.value, item.category.value)
         with st.expander(f"{item.id} · {label}", expanded=True):
             st.markdown(f"**Finding:** {item.title}")
             st.caption(_streamlit_priority(item.status.value))
@@ -356,20 +368,81 @@ def _render_findings_overview(report: ComparisonReport) -> None:
             with evidence_columns[0]:
                 st.markdown("**What the Wiki says**")
                 if item.wiki:
-                    st.write(item.wiki.description)
-                    st.caption(item.wiki.location)
+                    _render_evidence_command(item.wiki)
                 else:
                     st.info("No matching Wiki action was linked.")
             with evidence_columns[1]:
                 st.markdown("**What the script does**")
                 if item.script:
                     for evidence in item.script:
-                        st.write(evidence.description)
-                        st.caption(evidence.location)
+                        _render_evidence_command(evidence)
                 elif item.status.value == "missing":
                     st.info("No matching Bash action was found.")
 
             st.info(f"Recommended next step: {item.recommendation}")
+
+
+@st.dialog("Saved comparison report", width="large")
+def _render_saved_report_dialog(report: ComparisonReport) -> None:
+    """Show a selected historical report separately from the comparison page."""
+    report_title = f"{report.package} {report.version or ''}".strip()
+    st.markdown(f"### {escape(report_title)}")
+    st.caption("Saved report · viewing this report does not replace the comparison page.")
+    _render_result_banner(report)
+
+    overview_tab, report_tab, data_tab, code_tab = st.tabs(
+        ("Overview", "Full report", "Structured data", "Code")
+    )
+    with overview_tab:
+        _render_findings_overview(report)
+    with report_tab:
+        st.markdown(render_report(report, "markdown"))
+    with data_tab:
+        st.json(report.model_dump(mode="json", exclude_none=True))
+    with code_tab:
+        _render_code_view(report)
+
+    _render_fix_pr_panel(report)
+    if st.button("Close report", key=f"buildguard_close_saved_report_{report.package}_{report.version}"):
+        previous_report = st.session_state.pop(
+            "buildguard_report_before_saved_view", None
+        )
+        previous_package = st.session_state.pop(
+            "buildguard_package_before_saved_view", None
+        )
+        st.session_state.pop("buildguard_saved_report_background_saved", None)
+        if previous_report is None:
+            st.session_state.pop("buildguard_report", None)
+        else:
+            st.session_state["buildguard_report"] = previous_report
+        if previous_package is None:
+            st.session_state.pop("buildguard_report_package", None)
+        else:
+            st.session_state["buildguard_report_package"] = previous_package
+        st.session_state.pop("buildguard_opened_report_id", None)
+        st.rerun()
+
+
+def _render_evidence_command(evidence) -> None:
+    """Keep source evidence concise: only the relevant line and command."""
+    if evidence.line_start is not None:
+        end = evidence.line_end or evidence.line_start
+        line_label = (
+            f"Line {end}"
+            if end == evidence.line_start
+            else f"Lines {evidence.line_start}–{end}"
+        )
+    else:
+        match = re.search(r"\blines?\s+(\d+)(?:\s*[-–]\s*(\d+))?", evidence.location, re.I)
+        line_label = ""
+        if match:
+            start, end = match.groups()
+            line_label = f"Line {start}" if not end or end == start else f"Lines {start}–{end}"
+    if line_label:
+        st.caption(line_label)
+    commands = evidence.commands
+    if commands:
+        st.code("\n".join(commands), language="bash")
 
 
 def _render_code_view(report: ComparisonReport) -> None:
@@ -445,50 +518,80 @@ def _render_fix_pr_panel(report: ComparisonReport) -> None:
         "BuildGuard can use the findings to prepare a minimal script change. "
         "Review the complete diff before creating a GitHub pull request."
     )
-    report_key = f"{report.package}:{report.version}:{report.script_source.path if report.script_source else ''}"
+    # Keep a proposal tied to the exact report that produced it.  A fresh
+    # comparison can keep the same package, version, and script path while
+    # changing its findings; using only those source labels would then leave
+    # an old proposal displayed for the new report.
+    report_key = report.model_dump_json(exclude_none=True)
     if st.session_state.get("buildguard_fix_report_key") != report_key:
         st.session_state.pop("buildguard_fix_proposal", None)
         st.session_state.pop("buildguard_fix_original", None)
         st.session_state.pop("buildguard_fix_result", None)
         st.session_state.pop("buildguard_fix_job_id", None)
+        st.session_state.pop("buildguard_fix_error", None)
         st.session_state.pop("buildguard_fix_reviewed", None)
         st.session_state["buildguard_fix_report_key"] = report_key
 
-    if st.button("Generate fix proposal", key="buildguard_generate_fix"):
-        job_id = api_client.start_fix_proposal(report)
-        st.session_state["buildguard_fix_job_id"] = job_id
-        st.session_state.pop("buildguard_fix_original", None)
-        st.session_state.pop("buildguard_fix_proposal", None)
-        st.session_state.pop("buildguard_fix_result", None)
-
     job_id = st.session_state.get("buildguard_fix_job_id")
-    if isinstance(job_id, str) and not st.session_state.get("buildguard_fix_proposal"):
-        status, result, error = api_client.get_fix_proposal(job_id)
-        if status == "running":
+    proposal_data = st.session_state.get("buildguard_fix_proposal")
+    button_label = (
+        "Generating fix proposal..."
+        if isinstance(job_id, str) and job_id
+        else "Generate fix proposal"
+    )
+    if st.button(
+        button_label,
+        key="buildguard_generate_fix",
+        disabled=bool(job_id),
+    ):
+        try:
+            new_job_id = api_client.start_fix_proposal(report)
+        except Exception as error:  # Display backend failures without a traceback.
+            st.session_state["buildguard_fix_error"] = str(error)
+        else:
+            st.session_state["buildguard_fix_job_id"] = new_job_id
+            st.session_state.pop("buildguard_fix_error", None)
+            st.session_state.pop("buildguard_fix_original", None)
+            st.session_state.pop("buildguard_fix_proposal", None)
+            st.session_state.pop("buildguard_fix_result", None)
+            job_id = new_job_id
+            proposal_data = None
+
+    error_message = st.session_state.get("buildguard_fix_error")
+    if isinstance(error_message, str) and error_message:
+        st.error(f"Could not generate a fix proposal: {error_message}")
+
+    if isinstance(job_id, str) and job_id and not proposal_data:
+        try:
+            status, result, error = api_client.get_fix_proposal(job_id)
+        except Exception as error:  # Keep polling failures visible to the user.
+            st.error(f"Could not read fix proposal status: {error}")
+            return
+        if status == "running" or status == "queued":
             st.info(
-                "The fix proposal is still being generated. You can change the "
-                "download format or browse the report; generation will continue."
+                "The fix proposal is still being generated. This panel checks "
+                "again automatically every two seconds."
             )
             return
-        if status == "failed":
+        if status == "failed" or status == "missing" or result is None:
+            message = error or "The backend returned no fix proposal."
             st.session_state.pop("buildguard_fix_job_id", None)
-            st.error(f"Could not generate a fix proposal: {error}")
-            return
-        if status == "missing" or result is None:
-            st.session_state.pop("buildguard_fix_job_id", None)
-            st.error(f"Could not generate a fix proposal: {error}")
+            st.session_state["buildguard_fix_error"] = message
+            st.error(f"Could not generate a fix proposal: {message}")
             return
         original, proposal = result
         st.session_state["buildguard_fix_original"] = original
         st.session_state["buildguard_fix_proposal"] = proposal.model_dump(mode="json")
         st.session_state.pop("buildguard_fix_job_id", None)
+        st.session_state.pop("buildguard_fix_error", None)
+        proposal_data = st.session_state["buildguard_fix_proposal"]
 
-    proposal_data = st.session_state.get("buildguard_fix_proposal")
     original = st.session_state.get("buildguard_fix_original")
     if not proposal_data or not isinstance(original, str):
         return
 
     proposal = ScriptFixProposal.model_validate(proposal_data)
+    st.success("Fix proposal ready for review.")
     st.markdown(f"**Summary:** {proposal.summary}")
     st.markdown(f"**Rationale:** {proposal.rationale}")
     if proposal.affected_finding_ids:
@@ -544,18 +647,20 @@ def _render_fix_pr_panel(report: ComparisonReport) -> None:
             st.success("Pull request created successfully.")
 
 
-def _streamlit_finding_label(status: str) -> str:
+def _streamlit_finding_label(status: str, category: str | None = None) -> str:
+    if status == "conflict" and category == "dependency_inconsistency":
+        return "Dependency versions differ"
     return {
         "missing": "Wiki instruction not found in the script",
         "extra": "Script action is not represented in the Wiki",
-        "conflict": "Wiki and script prescribe different behavior",
+        "conflict": "Wiki and script specify different values or behavior",
         "unused_configuration": "Configuration is defined but not used",
     }.get(status, "Finding requiring review")
 
 
 def _streamlit_priority(status: str) -> str:
     return {
-        "conflict": "High attention · the two sources may prescribe different behavior",
+        "conflict": "Review needed · confirm which source has the intended value",
         "missing": "Needs review · the Wiki describes an action not found in the script",
         "extra": "Needs review · the script performs an action not represented in the Wiki",
         "unused_configuration": "Cleanup candidate · the value is defined but not referenced",
@@ -616,6 +721,10 @@ def _render_comparison_progress(job_id: str) -> None:
     )
     st.session_state.pop("buildguard_comparison_job_id", None)
     st.session_state.pop("buildguard_comparison_package", None)
+    st.session_state.pop("buildguard_opened_report_id", None)
+    st.session_state.pop("buildguard_report_before_saved_view", None)
+    st.session_state.pop("buildguard_package_before_saved_view", None)
+    st.session_state.pop("buildguard_saved_report_background_saved", None)
     st.rerun()
 
 
@@ -623,6 +732,9 @@ if compare_clicked:
     st.session_state.pop("buildguard_report", None)
     st.session_state.pop("buildguard_report_package", None)
     st.session_state.pop("buildguard_opened_report_id", None)
+    st.session_state.pop("buildguard_report_before_saved_view", None)
+    st.session_state.pop("buildguard_package_before_saved_view", None)
+    st.session_state.pop("buildguard_saved_report_background_saved", None)
     st.session_state.pop("buildguard_comparison_job_id", None)
     st.session_state["buildguard_comparison_package"] = package.strip().casefold()
     try:
@@ -635,10 +747,13 @@ active_comparison_job = st.session_state.get("buildguard_comparison_job_id")
 if isinstance(active_comparison_job, str) and active_comparison_job:
     _render_comparison_progress(active_comparison_job)
 
-saved_report = None if active_comparison_job else st.session_state.get("buildguard_report")
+saved_report = st.session_state.get("buildguard_report")
 saved_package = st.session_state.get("buildguard_report_package")
-if saved_report:
-    opened_report = st.session_state.get("buildguard_opened_report_id") is not None
+opened_report = st.session_state.get("buildguard_opened_report_id") is not None
+if saved_report and opened_report:
+    _render_saved_report_dialog(ComparisonReport.model_validate(saved_report))
+
+if saved_report and not opened_report:
     if saved_package != package.strip().casefold() and not opened_report:
         st.info("The displayed report belongs to the previous package input. Run a new comparison to update it.")
     else:
@@ -668,18 +783,35 @@ if saved_report:
             st.write(
                 "One Wiki instruction can be implemented by many Bash commands, "
                 "variables, and functions. Those related commands count as one "
-                "semantic match. Internal setup and cleanup are ignored unless they "
-                "represent a meaningful user-facing build action."
+                "semantic match. Setup and cleanup are shown as findings only when "
+                "they change a user-facing build action."
             )
 
         report_title = f"{report.package} {report.version or ''}".strip()
-        title_column, format_column, download_column = st.columns([1.45, .8, .85])
+        title_column, rerun_column, format_column, download_column = st.columns([1.25, .9, .8, .85])
         with title_column:
             st.markdown(f'<div class="bg-report-heading">{escape(report_title)}</div>', unsafe_allow_html=True)
             st.markdown(
                 '<div class="bg-report-subheading">Comparison output</div>',
                 unsafe_allow_html=True,
             )
+        with rerun_column:
+            if st.button(
+                "Compare again",
+                key=f"buildguard_rerun_{report.package}_{report.version or 'latest'}",
+                disabled=bool(active_comparison_job),
+                use_container_width=True,
+                help="Run a fresh AI comparison while reusing parsed Wiki and script sources.",
+            ):
+                st.session_state["buildguard_comparison_package"] = report.package.strip().casefold()
+                try:
+                    st.session_state["buildguard_comparison_job_id"] = api_client.start_comparison(
+                        report.package,
+                        force_comparison=True,
+                    )
+                    st.rerun()
+                except Exception as error:  # Display backend failures without a traceback.
+                    st.error(f"Could not start a fresh comparison: {error}")
         with format_column:
             format_label = st.selectbox(
                 "Download format",
@@ -721,5 +853,5 @@ if saved_report:
             _render_code_view(report)
         _render_fix_pr_panel(report)
 
-if not saved_report:
+if not saved_report and not active_comparison_job:
     st.caption("Enter a package and run a comparison to begin.")

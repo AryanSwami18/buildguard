@@ -51,6 +51,15 @@ class ValidationResult(BaseModel):
     summary: str
 
 
+class AIValueDifference(BaseModel):
+    """Source values the AI says materially differ for one matched action."""
+
+    field: str
+    wiki_value: str
+    bash_step_id: str
+    bash_value: str
+
+
 class AIComparisonMatch(BaseModel):
     """A Wiki step and all Bash steps that implement it."""
 
@@ -61,6 +70,7 @@ class AIComparisonMatch(BaseModel):
     bash_step_ids: list[str] = Field(default_factory=list)
     category: DiscrepancyCategory | None = None
     recommendation: str | None = None
+    value_differences: list[AIValueDifference] = Field(default_factory=list)
 
 
 class AIComparisonResult(BaseModel):

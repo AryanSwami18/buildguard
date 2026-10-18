@@ -191,8 +191,12 @@ def test_script_webhook_target_preserves_package_version_and_branch() -> None:
         scripts_branch="master",
     )
     payload = {
-        "repository": {"full_name": "example/scripts"},
+        "repository": {
+            "full_name": "example/scripts",
+            "default_branch": "master",
+        },
         "ref": "refs/heads/master",
+        "after": "commit-1",
         "commits": [
             {
                 "modified": ["Alfresco/26.0.0/build_alfresco.sh"],
@@ -202,8 +206,8 @@ def test_script_webhook_target_preserves_package_version_and_branch() -> None:
     }
 
     assert _webhook_targets("push", payload, settings) == {
-        WebhookTarget("Alfresco", "26.0.0", False, True),
-        WebhookTarget("Bazel", "9.2.0", False, True),
+        WebhookTarget("Alfresco", "26.0.0", False, True, "push:commit-1"),
+        WebhookTarget("Bazel", "9.2.0", False, True, "push:commit-1"),
     }
     payload["ref"] = "refs/heads/feature"
     assert _webhook_targets("push", payload, settings) == set()
@@ -216,16 +220,41 @@ def test_script_webhook_maps_repository_alias_to_wiki_package() -> None:
         scripts_branch="master",
     )
     payload = {
-        "repository": {"full_name": "example/scripts"},
+        "repository": {
+            "full_name": "example/scripts",
+            "default_branch": "master",
+        },
         "ref": "refs/heads/master",
+        "after": "commit-2",
         "commits": [
             {"modified": ["AntLR/4.13.2/build_antlr4.sh"]},
         ],
     }
 
     assert _webhook_targets("push", payload, settings) == {
-        WebhookTarget("ANTLR-4", "4.13.2", False, True),
+        WebhookTarget("ANTLR-4", "4.13.2", False, True, "push:commit-2"),
     }
+
+
+def test_head_branch_webhook_ignores_pull_request_branch_pushes() -> None:
+    settings = Settings(
+        github_repo="example/docs",
+        scripts_repo="example/scripts",
+        scripts_branch="HEAD",
+    )
+    payload = {
+        "repository": {
+            "full_name": "example/scripts",
+            "default_branch": "master",
+        },
+        "ref": "refs/heads/buildguard/auto/Alfresco-25.3.0",
+        "after": "pr-branch-commit",
+        "commits": [
+            {"modified": ["Alfresco/25.3.0/build_alfresco.sh"]},
+        ],
+    }
+
+    assert _webhook_targets("push", payload, settings) == set()
 
 
 def test_webhook_signature_verification() -> None:

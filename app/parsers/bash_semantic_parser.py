@@ -546,6 +546,15 @@ class BashSemanticParser:
             ):
                 return ActionType.RUN_TEST
 
+        if executable in {"javac", "diff"}:
+            return ActionType.RUN_TEST
+
+        if executable == "java" and any(
+            marker in args
+            for marker in ("-cp", "-classpath", "org.antlr.v4.Tool", "TestRig")
+        ):
+            return ActionType.RUN_TEST
+
         if executable == "patch":
             return ActionType.APPLY_PATCH
 
@@ -651,6 +660,15 @@ class BashSemanticParser:
 
         if executable in {"mvn", "mvnw", "./mvnw", "gradle", "gradlew", "./gradlew", "make"}:
             return not any(arg in {"--version", "-version", "-v"} for arg in args)
+
+        if executable in {"javac", "diff"}:
+            return True
+
+        if executable == "java":
+            return any(
+                marker in args
+                for marker in ("-cp", "-classpath", "org.antlr.v4.Tool", "TestRig")
+            )
 
         if executable in {"npm", "npx", "yarn", "pnpm"}:
             return bool(args) and args[0] not in {"--version", "-v"}
