@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections import defaultdict
+from urllib.parse import unquote, urlparse
 
 from app.matching.context_matcher import similarity
 from app.models.build import BuildInstruction
@@ -26,7 +27,10 @@ from app.models.validation import (
 
 _VARIABLE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
 _WORD = re.compile(r"[a-z0-9][a-z0-9+_.-]{2,}")
-_VERSION = re.compile(r"(?<![a-z])(?:v)?\d+(?:\.\d+){1,3}(?![a-z])", re.I)
+_VERSION = re.compile(
+    r"(?<![a-z0-9.])(?:v)?\d+(?:\.\d+){1,3}(?![a-z0-9.])",
+    re.I,
+)
 _GITHUB_REPOSITORY = re.compile(
     r"github\.com/[^/\s\"']+/([A-Za-z0-9_.-]+)",
     re.I,
@@ -100,6 +104,15 @@ def normalize_command(command: str) -> str:
         return "patch"
     if executable == "update-alternatives":
         return "java_configuration" if "java" in command else "configuration"
+    if executable == "make" and any(
+        arg == "-j" or arg.startswith("-j") or arg == "--jobs"
+        for arg in args
+    ):
+        targets = [
+            arg for arg in args
+            if not arg.startswith("-") and not re.fullmatch(r"\d+", arg)
+        ]
+        return "make:parallel" + (":" + " ".join(targets[:2]) if targets else "")
     if executable in {"export", "sed", "chown"}:
         return "configuration"
     return executable + (":" + " ".join(args[:2]) if args else "")
@@ -221,6 +234,39 @@ def _families(step: BuildStep) -> set[str]:
         repository = repository.removesuffix(".git")
         families.add(re.sub(r"[^a-z0-9]+", "-", repository.lower()).strip("-"))
     return {family for family in families if family}
+
+
+def _identity_families(step: BuildStep) -> set[str]:
+    """Return families named by the action identity, excluding command context.
+
+    A test action can mention Go, JavaScript, and Maven in its commands while
+    still describing the ANTLR product. Version checks must use the product
+    identity, not every tool word in the code block.
+    """
+    # A structured component label is the strongest identity. Descriptions of
+    # tests often mention runtime names as well (for example "ANTLR tests for
+    # Go"); those are tool requirements, not the product being versioned.
+    identity_parts = (
+        (step.component, step.repository)
+        if step.component
+        else (
+            step.description,
+            step.repository,
+        )
+    )
+    identity = " ".join(value for value in identity_parts if value).lower().replace("_", "-")
+    families: set[str] = set()
+    if any(word in identity for word in _JAVA_WORDS):
+        families.add("java")
+    for family, aliases in _COMPONENT_ALIASES.items():
+        if any(alias in identity for alias in aliases):
+            families.add(family)
+    for family, pattern in _TOOL_FAMILY_PATTERNS.items():
+        if pattern.search(identity):
+            families.add(family)
+    if step.component:
+        families.add(re.sub(r"[^a-z0-9]+", "-", step.component.lower()).strip("-"))
+    return families
 
 
 def _component_tool_family(component: str | None) -> str | None:
@@ -349,7 +395,7 @@ def _value_overlap(left: BuildStep, right: BuildStep) -> float:
 
 
 def _normalize_package(value: str) -> str:
-    value = value.lower().replace("${jver}", "<java>").replace("$jver", "<java>")
+    value = value.strip().lower().replace("${jver}", "<java>").replace("$jver", "<java>")
     value = value.strip("'\"")
     if "openjdk" in value and any(marker in value for marker in ("jdk", "devel")):
         # Debian/Ubuntu use openjdk-17-jdk while RHEL/SLES use
@@ -410,6 +456,25 @@ _VERSIONED_PACKAGE_BASES = (
     "java",
 )
 
+_PACKAGE_MANAGER_ALIASES = {
+    "apt": "apt",
+    "apt-get": "apt",
+    "dnf": "dnf",
+    "yum": "yum",
+    "zypper": "zypper",
+}
+
+_WORKFLOW_ACTIONS = {
+    ActionType.DOWNLOAD,
+    ActionType.EXTRACT,
+    ActionType.INSTALL_PACKAGE,
+    ActionType.CLONE_REPOSITORY,
+    ActionType.CHECKOUT_SOURCE,
+    ActionType.APPLY_PATCH,
+    ActionType.BUILD_IMAGE,
+    ActionType.RUN_TEST,
+}
+
 
 def _meaningful_packages(step: BuildStep) -> set[str]:
     packages = set(step.packages)
@@ -418,7 +483,8 @@ def _meaningful_packages(step: BuildStep) -> set[str]:
     return {
         _normalize_package(package)
         for package in packages
-        if _normalize_package(package) not in _PACKAGE_NOISE
+        if _normalize_package(package)
+        and _normalize_package(package) not in _PACKAGE_NOISE
     }
 
 
@@ -481,6 +547,22 @@ def _packages_from_command(command: str) -> set[str]:
     ):
         return set(words)
     return set()
+
+
+def _package_managers(step: BuildStep) -> set[str]:
+    """Return package-manager families explicitly used by one step."""
+    managers: set[str] = set()
+    for command in step.commands:
+        try:
+            words = shlex.split(command, comments=False)
+        except ValueError:
+            words = command.split()
+        managers.update(
+            _PACKAGE_MANAGER_ALIASES[word]
+            for word in words
+            if word in _PACKAGE_MANAGER_ALIASES
+        )
+    return managers
 
 
 def _versioned_package_disagreement(
@@ -675,6 +757,25 @@ def _reconcile_strong_matches(
         if match.wiki_step is not None
     }
 
+    # The Wiki may begin by telling the operator to fetch and invoke the same
+    # shell script that BuildGuard is analyzing. That bootstrap step cannot be
+    # an operation implemented inside the downloaded script.
+    for match in by_wiki.values():
+        if match.wiki_step is None or not _is_bootstrap_script_instruction(
+            match.wiki_step, bash
+        ):
+            continue
+        match.status = MatchStatus.OUT_OF_SCOPE
+        match.category = None
+        match.recommendation = None
+        match.automation_step = None
+        match.automation_steps = []
+        match.explanation = (
+            "This Wiki instruction downloads the automation script being analyzed. "
+            "It is a prerequisite for the operator, so it is outside the script's "
+            "own build workflow."
+        )
+
     for wiki_step in wiki.steps:
         target = by_wiki.get(wiki_step.id)
         if target is None:
@@ -830,6 +931,283 @@ def _command_intents_without_failure_handler(step: BuildStep) -> set[str]:
     }
 
 
+def _workflow_actions(step: BuildStep) -> set[ActionType | str]:
+    """Extract substantive operations from a step and its command text.
+
+    A parser may represent a whole Wiki code block as one ``download`` step,
+    while the Bash parser exposes the download and extraction as separate
+    steps.  Comparing these coarse action labels alone loses that distinction,
+    so the command text contributes normalized workflow operations as well.
+    """
+    actions: set[ActionType | str] = set()
+    if step.action in _WORKFLOW_ACTIONS:
+        actions.add(step.action)
+
+    command_text = "\n".join(step.commands).lower()
+    if re.search(r"(?:^|[;&|])\s*(?:curl|wget|fetch)\b", command_text):
+        actions.add(ActionType.DOWNLOAD)
+    if re.search(r"\b(?:tar|unzip|7z)\s+(?:-[a-z]*x|x(?:[a-z]+)?\b)", command_text):
+        actions.add(ActionType.EXTRACT)
+    if re.search(r"\bgit\s+clone\b", command_text):
+        actions.add(ActionType.CLONE_REPOSITORY)
+    if re.search(r"\bgit\s+(?:checkout|switch|reset)\b", command_text):
+        actions.add(ActionType.CHECKOUT_SOURCE)
+    if re.search(r"\b(?:git\s+apply|patch\s+)", command_text):
+        actions.add(ActionType.APPLY_PATCH)
+    if re.search(r"\bdocker\s+build\b", command_text):
+        actions.add(ActionType.BUILD_IMAGE)
+    if re.search(r"\b(?:apt|apt-get|dnf|yum|zypper)\s+[^\n;&|]*\binstall\b", command_text):
+        actions.add(ActionType.INSTALL_PACKAGE)
+    if re.search(r"\b(?:apt|apt-get)\s+update\b", command_text):
+        actions.add("package_index_update")
+    if re.search(r"\bmake\b[^\n;&|]*(?:\s-j(?:\s|\d|\$)|\s--jobs(?:=|\s))", command_text):
+        actions.add("parallel_build")
+    return actions
+
+
+def _is_bootstrap_script_instruction(
+    wiki_step: BuildStep,
+    bash: BuildInstruction,
+) -> bool:
+    """Identify Wiki instructions that download the very script being checked.
+
+    These are operator bootstrap directions, not operations the script can
+    perform on itself. Matching the downloaded filename to the script source
+    identity keeps this rule applicable across packages and repositories.
+    """
+    if wiki_step.action not in {ActionType.DOWNLOAD, ActionType.RUN_COMMAND}:
+        return False
+    labels = " ".join(
+        value
+        for value in (
+            wiki_step.description,
+            wiki_step.context.subsection,
+            " ".join(wiki_step.context.heading_path),
+        )
+        if value
+    ).lower()
+    if not re.search(r"\b(?:build\s+)?script\b", labels):
+        return False
+
+    script_names: set[str] = set()
+    if bash.source_metadata is not None:
+        script_names.add(bash.source_metadata.filename.lower())
+        script_names.add(bash.source_metadata.path.rsplit("/", 1)[-1].lower())
+    if bash.name:
+        script_names.add(bash.name.rsplit("/", 1)[-1].lower())
+    script_names.update(
+        step.context.source_name.rsplit("/", 1)[-1].lower()
+        for step in bash.steps
+        if step.context.source_name
+    )
+    script_names.discard("")
+    if not script_names:
+        return False
+
+    urls = set(wiki_step.urls)
+    urls.update(re.findall(r"https?://[^\s\"'<>]+", " ".join(wiki_step.commands)))
+    for url in urls:
+        filename = unquote(urlparse(url.rstrip(".,);]")).path.rsplit("/", 1)[-1]).lower()
+        if filename in script_names:
+            return True
+    return False
+
+
+def _parallelism_values(steps: list[BuildStep]) -> set[tuple[str, str]]:
+    """Return concrete/dynamic make job settings found in grouped commands."""
+    settings: set[tuple[str, str]] = set()
+    for step in steps:
+        for command in step.commands:
+            if not re.search(r"\bmake\b", command):
+                continue
+            match = re.search(
+                r"(?:^|\s)(?:-j\s*(?P<short>[^\s;&|]+)?|--jobs(?:=\s*|\s+)(?P<long>[^\s;&|]+))",
+                command,
+            )
+            if not match:
+                continue
+            value = match.group("short") or match.group("long") or "unbounded"
+            value = value.strip().strip("'\"")
+            if value.isdigit():
+                settings.add(("fixed", value))
+            elif re.search(r"nproc|sysctl|cpu", value, re.I):
+                settings.add(("host-dependent", value))
+            elif value.startswith("$") or "$" in value:
+                settings.add(("variable", value))
+            else:
+                settings.add(("symbolic", value))
+    return settings
+
+
+def _parallelism_conflict(
+    wiki: BuildStep,
+    group: list[BuildStep],
+) -> tuple[tuple[str, str], tuple[str, str]] | None:
+    wiki_values = _parallelism_values([wiki])
+    script_values = _parallelism_values(group)
+    for wiki_value in sorted(wiki_values):
+        for script_value in sorted(script_values):
+            if wiki_value != script_value and wiki_value[0] == "fixed":
+                return wiki_value, script_value
+            if wiki_value != script_value and script_value[0] == "fixed":
+                return wiki_value, script_value
+    return None
+
+
+def _configuration_supports_workflow(wiki: BuildStep, script: BuildStep) -> bool:
+    """Whether a configuration assignment supplies evidence for a Wiki action.
+
+    Version/ref/url assignments are not build actions by themselves, but they
+    are essential evidence when the consuming download/checkout command is in
+    another Bash AST node.  This deliberately requires a component/family or
+    configuration-name relationship so unrelated global settings are not
+    pulled into every match.
+    """
+    if script.action != ActionType.SET_VARIABLE:
+        return False
+    shared_families = _identity_families(wiki) & _families(script) - {"docker"}
+    if shared_families:
+        return True
+    wiki_text = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        " ".join(
+            value
+            for value in (
+                wiki.description,
+                wiki.component,
+                wiki.repository,
+                *wiki.environment.keys(),
+                *wiki.commands,
+            )
+            if value
+        ).lower(),
+    )
+    generic_families = {
+        "package", "source", "build", "version", "path", "root", "log",
+        "temp", "home", "file", "name",
+    }
+    for name in script.environment:
+        normalized_name = re.sub(r"[^a-z0-9]+", "", name.lower())
+        if not normalized_name.endswith(("version", "commit", "ref", "url", "tar", "image")):
+            continue
+        variable_family = re.sub(
+            r"(?:version|commit|ref|url|tar|image)$", "", normalized_name
+        )
+        if (
+            variable_family
+            and variable_family not in generic_families
+            and variable_family in wiki_text
+        ):
+            return True
+    return False
+
+
+def _workflow_missing_actions(
+    wiki: BuildStep,
+    group: list[BuildStep],
+) -> list[str]:
+    """Find substantive operations documented in a Wiki action but absent from
+    its grouped Bash implementation.
+
+    Installation has two valid implementation forms: package installation or
+    download/extract/configure.  Therefore a Wiki package-install action does
+    not require a literal package-manager command when the script implements a
+    complete archive-based installation workflow.
+    """
+    if not group:
+        return []
+    required = _workflow_actions(wiki)
+    implemented = {
+        action
+        for step in group
+        for action in _workflow_actions(step)
+    }
+    missing: list[str] = []
+
+    if ActionType.INSTALL_PACKAGE in required:
+        if (
+            ActionType.INSTALL_PACKAGE not in implemented
+            and not {
+                ActionType.DOWNLOAD,
+                ActionType.EXTRACT,
+            }.issubset(implemented)
+        ):
+            missing.append("package installation")
+
+    for action, label in (
+        (ActionType.DOWNLOAD, "download"),
+        (ActionType.EXTRACT, "archive extraction"),
+        (ActionType.CLONE_REPOSITORY, "repository clone"),
+        (ActionType.CHECKOUT_SOURCE, "source checkout"),
+        (ActionType.APPLY_PATCH, "patch application"),
+        (ActionType.BUILD_IMAGE, "Docker image build"),
+        (ActionType.RUN_TEST, "test execution"),
+    ):
+        if action in required and action not in implemented:
+            missing.append(label)
+
+    if "package_index_update" in required and ActionType.INSTALL_PACKAGE in implemented:
+        wiki_managers = _package_managers(wiki)
+        script_managers = {
+            manager
+            for step in group
+            for manager in _package_managers(step)
+        }
+        if (
+            not wiki_managers
+            or not script_managers
+            or wiki_managers & script_managers
+        ) and "package_index_update" not in implemented:
+            missing.append("package-index refresh")
+    return missing
+
+
+def _package_difference(
+    wiki: BuildStep,
+    group: list[BuildStep],
+) -> tuple[set[str], set[str]]:
+    """Return Wiki-missing and script-only packages for a matching branch."""
+    wiki_packages = _meaningful_packages(wiki)
+    if not wiki_packages:
+        return set(), set()
+    relevant_steps = _relevant_package_steps(wiki, group)
+    if not relevant_steps:
+        return set(), set()
+    script_packages = set().union(
+        *(_meaningful_packages(step) for step in relevant_steps)
+    )
+    return wiki_packages - script_packages, script_packages - wiki_packages
+
+
+def _relevant_package_steps(
+    wiki: BuildStep,
+    group: list[BuildStep],
+) -> list[BuildStep]:
+    """Select script dependency commands from the same distro branch."""
+    wiki_managers = _package_managers(wiki)
+    return [
+        step
+        for step in group
+        if ActionType.INSTALL_PACKAGE in _workflow_actions(step)
+        and (
+            not wiki_managers
+            or not _package_managers(step)
+            or wiki_managers & _package_managers(step)
+        )
+    ]
+
+
+def _workflow_explanation(missing: list[str]) -> str:
+    labels = ", ".join(missing)
+    return (
+        f"The Wiki action includes {labels}, but no corresponding operation was "
+        "found in the grouped Bash workflow. The other related commands are "
+        "shown as evidence, so this is a missing part of one documented action "
+        "rather than a separate finding for every shell statement."
+    )
+
+
 def _has_global_pipeline_failure_protection(step: BuildStep) -> bool:
     labels = set(step.context.context_labels)
     return {"shell_errexit", "shell_pipefail"}.issubset(labels)
@@ -911,6 +1289,18 @@ def _same_workflow(wiki: BuildStep, primary: BuildStep, candidate: BuildStep) ->
     if (
         wiki.action == ActionType.INSTALL_PACKAGE
     ):
+        if "package_index_update" in _workflow_actions(candidate):
+            wiki_managers = _package_managers(wiki)
+            candidate_managers = _package_managers(candidate)
+            return bool(
+                (not wiki_managers or not candidate_managers or wiki_managers & candidate_managers)
+                and (
+                    not primary.context.subsection
+                    or not candidate.context.subsection
+                    or primary.context.subsection == candidate.context.subsection
+                    or abs(candidate.order - primary.order) <= 12
+                )
+            )
         if (
             "java" in _families(wiki)
             and "java" in (primary_families & candidate_families)
@@ -934,6 +1324,15 @@ def _same_workflow(wiki: BuildStep, primary: BuildStep, candidate: BuildStep) ->
             # curl and make. Keep a close package match, allowing a concrete
             # version difference to be reported as a conflict.
             return overlap >= 0.75
+        if candidate.action == ActionType.CONFIGURE:
+            candidate_command = " ".join(candidate.commands).lower()
+            wiki_command = " ".join(wiki.commands).lower()
+            # Keep platform-specific compiler alternatives with the SLES
+            # dependency block that documents them. Do not attach those
+            # commands to unrelated yum/apt branches just because they share
+            # a helper function.
+            if "update-alternatives" in candidate_command:
+                return "update-alternatives" in wiki_command
         return bool(
             primary.context.subsection
             and primary.context.subsection == candidate.context.subsection
@@ -1176,6 +1575,14 @@ def _group_for(wiki: BuildStep, script_steps: list[BuildStep]) -> tuple[list[Bui
             or candidate.component
             or candidate.repository
         ]
+
+    # Version/ref/url assignments are evidence for the grouped action, not
+    # independent Bash operations. Keep them with their consuming workflow so
+    # concrete values can be compared across AST nodes.
+    for candidate in script_steps:
+        if candidate in group or not _configuration_supports_workflow(wiki, candidate):
+            continue
+        group.append(candidate)
     return sorted(group, key=lambda step: step.order), score
 
 
@@ -1184,6 +1591,8 @@ def _group_conflicts(wiki: BuildStep, group: list[BuildStep]) -> bool:
     if not group:
         return False
     script = group
+    if _parallelism_conflict(wiki, script):
+        return True
     if wiki.version and _is_concrete(wiki.version):
         values: set[str] = set()
         for step in script:
@@ -1193,9 +1602,11 @@ def _group_conflicts(wiki: BuildStep, group: list[BuildStep]) -> bool:
                 or bool(shared_families)
             ):
                 values.add(step.version)
-            values.update(_relevant_version_values(wiki, step))
+            values.update(_relevant_version_values(wiki, step, script))
         concrete_values = {value for value in values if _is_concrete(value)}
-        if concrete_values and wiki.version not in concrete_values:
+        if concrete_values and _version_key(wiki.version) not in {
+            _version_key(value) for value in concrete_values
+        }:
             # A Java build image may carry the product version while its Java
             # installation is parameterized; do not compare those unrelated
             # tags as if they were one value.
@@ -1244,15 +1655,21 @@ def _group_conflicts(wiki: BuildStep, group: list[BuildStep]) -> bool:
             return True
 
     if wiki.packages:
-        wiki_packages = {_normalize_package(value) for value in wiki.packages}
+        missing_packages, extra_packages = _package_difference(wiki, script)
+        wiki_packages = _meaningful_packages(wiki)
+        relevant_package_steps = _relevant_package_steps(wiki, script)
         script_packages = {
             _normalize_package(package)
-            for step in script
-            for package in step.packages
+            for step in relevant_package_steps
+            for package in _meaningful_packages(step)
         }
-        if script_packages and (
-            wiki_packages.isdisjoint(script_packages)
-            or _versioned_package_disagreement(wiki_packages, script_packages)
+        if (
+            missing_packages
+            or extra_packages
+            or script_packages and (
+                wiki_packages.isdisjoint(script_packages)
+                or _versioned_package_disagreement(wiki_packages, script_packages)
+            )
         ):
             return True
     return False
@@ -1262,26 +1679,49 @@ def _group_conflict_category(
     wiki: BuildStep, group: list[BuildStep]
 ) -> DiscrepancyCategory:
     """Use a category that describes the concrete values that disagree."""
+    if _parallelism_conflict(wiki, group):
+        return DiscrepancyCategory.CONFIGURATION_MISMATCH
     if wiki.packages:
-        wiki_packages = {_normalize_package(value) for value in wiki.packages}
-        script_packages = {
-            _normalize_package(package)
-            for step in group
-            for package in step.packages
-        }
-        if _versioned_package_disagreement(wiki_packages, script_packages):
+        missing_packages, extra_packages = _package_difference(wiki, group)
+        wiki_packages = _meaningful_packages(wiki)
+        relevant_package_steps = _relevant_package_steps(wiki, group)
+        script_packages = set().union(
+            *(_meaningful_packages(step) for step in relevant_package_steps)
+        ) if relevant_package_steps else set()
+        if (
+            missing_packages
+            or extra_packages
+            or _versioned_package_disagreement(wiki_packages, script_packages)
+        ):
             return DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
     return DiscrepancyCategory.VERSION_INCONSISTENCY
 
 
 def _group_conflict_explanation(wiki: BuildStep, group: list[BuildStep]) -> str:
     """Explain a recovered conflict with the differing values when available."""
-    wiki_packages = {_normalize_package(value) for value in wiki.packages}
-    script_packages = {
-        _normalize_package(package)
-        for step in group
-        for package in step.packages
-    }
+    parallelism = _parallelism_conflict(wiki, group)
+    if parallelism:
+        wiki_setting, script_setting = parallelism
+        wiki_jobs = (
+            wiki_setting[1]
+            if wiki_setting[0] == "fixed"
+            else f"{wiki_setting[1]} ({wiki_setting[0]})"
+        )
+        script_jobs = (
+            script_setting[1]
+            if script_setting[0] == "fixed"
+            else f"{script_setting[1]} ({script_setting[0]})"
+        )
+        return (
+            f"The Wiki runs make with {wiki_jobs} parallel job(s), while the script "
+            f"uses {script_jobs}. This changes build parallelism and resource use; "
+            "confirm whether the fixed limit or host-dependent setting is intended."
+        )
+    wiki_packages = _meaningful_packages(wiki)
+    relevant_package_steps = _relevant_package_steps(wiki, group)
+    script_packages = set().union(
+        *(_meaningful_packages(step) for step in relevant_package_steps)
+    ) if relevant_package_steps else set()
     for base in _VERSIONED_PACKAGE_BASES:
         wiki_values = sorted(
             package for package in wiki_packages
@@ -1314,15 +1754,20 @@ def _group_conflict_explanation(wiki: BuildStep, group: list[BuildStep]) -> str:
         for step in group:
             script_versions.update(
                 value
-                for value in _relevant_version_values(wiki, step)
+                for value in _relevant_version_values(wiki, step, group)
                 if _is_concrete(value)
             )
-        differing_versions = sorted(script_versions - {wiki.version})
+        differing_versions = sorted(
+            value
+            for value in script_versions
+            if _version_key(value) != _version_key(wiki.version)
+        )
         if differing_versions:
             return (
                 f"The Wiki specifies version {wiki.version}, while the script uses "
                 f"{', '.join(differing_versions)} for the corresponding component. "
                 "Confirm which version is intended and align both sources."
+                + _missing_workflow_suffix(wiki, group)
             )
     if wiki.commit and _is_concrete(wiki.commit):
         commit_keys = _wiki_config_keys(wiki, "COMMIT")
@@ -1377,39 +1822,118 @@ def _group_conflict_explanation(wiki: BuildStep, group: list[BuildStep]) -> str:
                 f"{', '.join(differing_images)}. Confirm the intended image and align "
                 "both sources."
             )
+    missing_packages, extra_packages = _package_difference(wiki, group)
+    if missing_packages or extra_packages:
+        details: list[str] = []
+        if missing_packages:
+            details.append(f"the Wiki lists {', '.join(sorted(missing_packages))}")
+        if extra_packages:
+            details.append(
+                f"the script additionally installs {', '.join(sorted(extra_packages))}"
+            )
+        return (
+            "The dependency lists differ for the same package-manager branch: "
+            + "; ".join(details)
+            + ". Confirm whether the dependency list or the source is outdated."
+            + _missing_workflow_suffix(wiki, group)
+        )
     return (
         "The script implements this grouped build action, but a concrete version, "
         "commit, repository, image, or package value differs."
     )
 
 
-def _relevant_version_values(wiki: BuildStep, script: BuildStep) -> set[str]:
+def _relevant_version_values(
+    wiki: BuildStep,
+    script: BuildStep,
+    related_steps: list[BuildStep] | None = None,
+) -> set[str]:
     """Return script version values belonging to the Wiki action's component."""
-    component = re.sub(r"[^a-z0-9]+", "", (wiki.component or "").lower())
-    wiki_text = " ".join(
-        [
+    identity_parts = (
+        (wiki.component, wiki.repository)
+        if wiki.component
+        else (
             wiki.description,
-            *wiki.commands,
-            *wiki.environment.keys(),
-            *wiki.environment.values(),
-        ]
-    ).lower()
-    wiki_text_normalized = re.sub(r"[^a-z0-9]+", "", wiki_text)
+            wiki.repository,
+        )
+    )
+    identity_text = " ".join(value for value in identity_parts if value).lower()
+    identity_families = _identity_families(wiki)
+    mentioned_variables = set(_VARIABLE.findall(" ".join(wiki.commands)))
+    mentioned_variables = {
+        value.strip("${}") for value in mentioned_variables
+    }
     values: set[str] = set()
-    for name, value in script.environment.items():
-        upper_name = name.upper()
-        if "VERSION" not in upper_name:
+    local_names = set(script.environment)
+    environment: dict[str, str] = {}
+    for related_step in [*(related_steps or []), script]:
+        environment.update(related_step.environment)
+    resolved_environment = _resolved_environment(environment)
+    for name, value in resolved_environment.items():
+        if name not in local_names:
             continue
-        normalized_name = re.sub(r"[^a-z0-9]+", "", name.lower())
-        variable_family = re.sub(r"version$", "", normalized_name)
-        if name in wiki.environment or (
-            component and component in normalized_name
-        ) or (
-            variable_family
-            and variable_family in wiki_text_normalized
+        upper_name = name.upper()
+        if not any(
+            marker in upper_name
+            for marker in ("VERSION", "RELEASE", "TAG", "REF", "COMMIT")
+        ):
+            continue
+        value_families = _configuration_name_families(name)
+        if (
+            name in wiki.environment
+            or name in mentioned_variables
+            or bool(identity_families & value_families)
         ):
             values.add(value)
+    # Some parsers retain the version only inside a URL/TAR variable. Resolve
+    # those values too when the variable belongs to the Wiki component.
+    for name, value in resolved_environment.items():
+        if name not in local_names:
+            continue
+        normalized_name = re.sub(r"[^a-z0-9]+", "", name.lower())
+        variable_family = re.sub(
+            r"(?:version|release|tag|ref|commit|url|tar)$", "", normalized_name
+        )
+        if not variable_family:
+            continue
+        value_families = _configuration_name_families(name)
+        if not (
+            name in wiki.environment
+            or name in mentioned_variables
+            or identity_families & value_families
+        ):
+            continue
+        values.update(_VERSION.findall(value))
     return values
+
+
+def _configuration_name_families(name: str) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "", name.lower())
+    families: set[str] = set()
+    for family, aliases in {
+        "go": ("go", "golang", "goroot"),
+        "nodejs": ("node", "nodejs"),
+        "maven": ("maven", "mvn"),
+        "antlr": ("antlr",),
+        "java": ("java", "jdk", "jre", "temurin", "semeru", "openjdk"),
+        "activemq": ("activemq",),
+        "qemu": ("qemu",),
+        "tomcat": ("tomcat",),
+        "community-repo": ("communityrepo",),
+        "community-share": ("communityshare",),
+        "search-services": ("searchservices",),
+        "transform-core": ("transformcore",),
+        "content-app": ("contentapp",),
+        "docker-compose": ("dockercompose",),
+    }.items():
+        if any(alias in normalized for alias in aliases):
+            families.add(family)
+    return families
+
+
+def _missing_workflow_suffix(wiki: BuildStep, group: list[BuildStep]) -> str:
+    missing = _workflow_missing_actions(wiki, group)
+    return f" The grouped workflow also omits: {', '.join(missing)}." if missing else ""
 
 
 def _wiki_config_keys(wiki: BuildStep, suffix: str) -> set[str]:
@@ -1455,14 +1979,38 @@ def _conflicting_value_steps(
     conflicting: list[BuildStep] = []
     if wiki.version and _is_concrete(wiki.version):
         for step in group:
-            values = set(_relevant_version_values(wiki, step))
+            values = set(_relevant_version_values(wiki, step, group))
             shared_families = _families(wiki) & _families(step) - {"docker"}
             if step.version and (
                 _same_component_identity(wiki, step) or shared_families
             ):
                 values.add(step.version)
-            if any(_is_concrete(value) and value != wiki.version for value in values):
+            if any(
+                _is_concrete(value)
+                and _version_key(value) != _version_key(wiki.version)
+                for value in values
+            ):
                 conflicting.append(step)
+    if not conflicting and wiki.packages:
+        _missing_packages, extra_packages = _package_difference(wiki, group)
+        if _missing_packages or extra_packages:
+            wiki_managers = _package_managers(wiki)
+            conflicting.extend(
+                step
+                for step in group
+                if ActionType.INSTALL_PACKAGE in _workflow_actions(step)
+                and (
+                    not wiki_managers
+                    or not _package_managers(step)
+                    or wiki_managers & _package_managers(step)
+                )
+            )
+    if not conflicting and _parallelism_conflict(wiki, group):
+        conflicting.extend(
+            step
+            for step in group
+            if _parallelism_values([step])
+        )
     if not conflicting and wiki.commit and _is_concrete(wiki.commit):
         commit_keys = _wiki_config_keys(wiki, "COMMIT")
         for step in group:
@@ -1492,6 +2040,11 @@ def _conflicting_value_steps(
 
 def _is_concrete(value: str) -> bool:
     return not re.search(r"\$|\{|\}|<var>|\$\(", value)
+
+
+def _version_key(value: str) -> str:
+    """Normalize harmless version spelling differences such as ``v1.2.3``."""
+    return value.strip().strip("'\"").lower().removeprefix("v")
 
 
 def _dedupe(steps: list[BuildStep]) -> list[BuildStep]:
@@ -1564,12 +2117,18 @@ def normalize_validation_result(
             match.automation_step = group[0]
             match.explanation = _group_conflict_explanation(match.wiki_step, group)
         else:
-            match.status = MatchStatus.MATCHED
-            match.category = None
-            match.explanation = (
-                f"Grouped semantic implementation matched the Wiki action "
-                f"(score {score:.2f}); individual shell commands are implementation details."
-            )
+            missing_actions = _workflow_missing_actions(match.wiki_step, group)
+            if missing_actions:
+                match.status = MatchStatus.MISSING
+                match.category = DiscrepancyCategory.MISSING_STEP
+                match.explanation = _workflow_explanation(missing_actions)
+            else:
+                match.status = MatchStatus.MATCHED
+                match.category = None
+                match.explanation = (
+                    f"Grouped semantic implementation matched the Wiki action "
+                    f"(score {score:.2f}); individual shell commands are implementation details."
+                )
 
     # The AI can call an operation a match while overlooking a concrete value
     # difference (for example, Wiki clang7 versus script clang13). Audit those
@@ -1579,7 +2138,17 @@ def normalize_validation_result(
         if match.status != MatchStatus.MATCHED or match.wiki_step is None:
             continue
         group, _score = _group_for(match.wiki_step, bash.steps)
-        if not group or not _group_conflicts(match.wiki_step, group):
+        if not group:
+            continue
+        missing_actions = _workflow_missing_actions(match.wiki_step, group)
+        if missing_actions and not _group_conflicts(match.wiki_step, group):
+            match.automation_steps = group
+            match.automation_step = group[0]
+            match.status = MatchStatus.MISSING
+            match.category = DiscrepancyCategory.MISSING_STEP
+            match.explanation = _workflow_explanation(missing_actions)
+            continue
+        if not _group_conflicts(match.wiki_step, group):
             continue
         match.automation_steps = group
         match.automation_step = group[0]

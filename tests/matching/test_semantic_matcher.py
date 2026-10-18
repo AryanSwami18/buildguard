@@ -1,11 +1,13 @@
 from app.matching.semantic_matcher import (
     _group_conflicts,
+    _workflow_missing_actions,
     normalize_command,
     normalize_validation_result,
 )
 from app.models.build import BuildInstruction
 from app.models.context import SourceContext
 from app.models.step import ActionType, BuildStep
+from app.sources.github import GitHubSource
 from app.models.validation import (
     DiscrepancyCategory,
     MatchStatus,
@@ -626,3 +628,197 @@ def test_ai_matched_label_cannot_hide_versioned_dependency_conflict() -> None:
     assert result.matches[0].category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
     assert "clang7" in result.matches[0].explanation
     assert "clang13" in result.matches[0].explanation
+
+
+def test_cross_step_configuration_and_missing_extract_are_reported_generically() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.DOWNLOAD,
+        "Download Apache Maven",
+        commands=[
+            "curl -O https://example.test/apache-maven-${MAVEN_VERSION}.tar.gz",
+            "tar xzf ${MAVEN_TAR}",
+        ],
+        version="3.8.6",
+        component="Apache Maven",
+    ).model_copy(update={"environment": {"MAVEN_TAR": "apache-maven-3.8.6-bin.tar.gz"}})
+    script_steps = parse_bash_steps(
+        'MAVEN_VERSION="3.9.11"\n'
+        'MAVEN_URL="https://example.test/apache-maven-$MAVEN_VERSION.tar.gz"\n'
+        'curl -O $MAVEN_URL\n',
+        "build.sh",
+    )
+    bash_download = next(step for step in script_steps if step.action == ActionType.DOWNLOAD)
+    wiki = BuildInstruction(name="wiki", source="wiki", steps=[wiki_step])
+    bash = BuildInstruction(name="build.sh", source="bash", steps=script_steps)
+
+    assert _workflow_missing_actions(wiki_step, [*script_steps]) == ["archive extraction"]
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(
+                    wiki_step=wiki_step,
+                    automation_step=bash_download,
+                    status=MatchStatus.MATCHED,
+                    explanation="AI says these match",
+                ),
+            ],
+            valid=True,
+            summary="",
+        ),
+        wiki,
+        bash,
+    )
+
+    assert result.matches[0].status == MatchStatus.CONFLICT
+    assert "3.8.6" in result.matches[0].explanation
+    assert "3.9.11" in result.matches[0].explanation
+    assert "archive extraction" in result.matches[0].explanation
+
+
+def test_extra_dependency_and_missing_package_index_are_actionable() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.INSTALL_PACKAGE,
+        "Install Debian build dependencies",
+        commands=[
+            "sudo apt-get update",
+            "sudo apt-get install -y curl wget",
+        ],
+        packages=["curl", "wget"],
+    )
+    script_steps = parse_bash_steps(
+        "sudo apt-get install -y curl wget jq\n",
+        "build.sh",
+    )
+    bash_install = script_steps[0]
+    wiki = BuildInstruction(name="wiki", source="wiki", steps=[wiki_step])
+    bash = BuildInstruction(name="build.sh", source="bash", steps=script_steps)
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(
+                    wiki_step=wiki_step,
+                    automation_step=bash_install,
+                    status=MatchStatus.MATCHED,
+                    explanation="AI says these match",
+                ),
+            ],
+            valid=True,
+            summary="",
+        ),
+        wiki,
+        bash,
+    )
+
+    assert result.matches[0].status == MatchStatus.CONFLICT
+    assert result.matches[0].category == DiscrepancyCategory.DEPENDENCY_INCONSISTENCY
+    assert "jq" in result.matches[0].explanation
+    assert "package-index refresh" in result.matches[0].explanation
+
+
+def test_product_version_is_not_compared_with_a_runtime_tool_version() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.RUN_TEST,
+        "Run the ANTLR test suite for Go",
+        commands=["mvn -Dtest=go.** test"],
+        version="4.13.2",
+        component="ANTLR 4",
+    )
+    go_setup = _step(
+        "bash-1",
+        ActionType.SET_VARIABLE,
+        "GOLANG_VERSION='1.19.5'",
+    ).model_copy(update={"environment": {"GOLANG_VERSION": "1.19.5"}})
+
+    assert not _group_conflicts(wiki_step, [go_setup])
+
+
+def test_bootstrap_download_of_the_analyzed_script_is_out_of_scope() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.DOWNLOAD,
+        "Download and install the build script",
+        commands=[
+            "wget -q https://example.test/project/build_component.sh",
+        ],
+        urls=["https://example.test/project/build_component.sh"],
+    )
+    wiki = BuildInstruction(name="guide", source="wiki", steps=[wiki_step])
+    bash = BuildInstruction(
+        name="build_component.sh",
+        source="bash",
+        source_metadata=GitHubSource(
+            repository="example/scripts",
+            ref="main",
+            path="Component/1.0/build_component.sh",
+            filename="build_component.sh",
+            github_url="https://github.com/example/scripts/blob/main/Component/1.0/build_component.sh",
+        ),
+        steps=[
+            _step(
+                "bash-1",
+                ActionType.RUN_COMMAND,
+                "Build component",
+                commands=["make"],
+            )
+        ],
+    )
+
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(
+                    wiki_step=wiki_step,
+                    status=MatchStatus.MISSING,
+                    explanation="missing",
+                )
+            ],
+            valid=False,
+            summary="",
+        ),
+        wiki,
+        bash,
+    )
+
+    assert result.matches[0].status == MatchStatus.OUT_OF_SCOPE
+    assert not result.matches[0].automation_steps
+
+
+def test_fixed_make_parallelism_vs_host_cpu_count_is_reported_as_configuration() -> None:
+    wiki_step = _step(
+        "wiki-1",
+        ActionType.RUN_COMMAND,
+        "Build component with eight parallel jobs",
+        commands=["make -j 8"],
+        component="Component",
+    )
+    script_step = _step(
+        "bash-1",
+        ActionType.RUN_COMMAND,
+        "Build component using available CPUs",
+        commands=["make -j$(nproc)"],
+        component="Component",
+    )
+    result = normalize_validation_result(
+        ValidationResult(
+            matches=[
+                StepMatch(
+                    wiki_step=wiki_step,
+                    automation_step=script_step,
+                    status=MatchStatus.MATCHED,
+                    explanation="AI says these match",
+                )
+            ],
+            valid=True,
+            summary="",
+        ),
+        BuildInstruction(name="wiki", source="wiki", steps=[wiki_step]),
+        BuildInstruction(name="build.sh", source="bash", steps=[script_step]),
+    )
+
+    assert result.matches[0].status == MatchStatus.CONFLICT
+    assert result.matches[0].category == DiscrepancyCategory.CONFIGURATION_MISMATCH
+    assert "8 parallel job" in result.matches[0].explanation
+    assert "nproc" in result.matches[0].explanation

@@ -37,7 +37,7 @@ ProgressCallback = Callable[[str], None]
 
 WIKI_PARSER_VERSION = "wiki-buildsteps-v1"
 BASH_PARSER_VERSION = "bash-semantic-v4"
-COMPARISON_ANALYSIS_VERSION = "comparison-v12-duplicate-aware-ownership"
+COMPARISON_ANALYSIS_VERSION = "comparison-v13-semantic-workflow-audit"
 
 
 class SourcePending(RuntimeError):

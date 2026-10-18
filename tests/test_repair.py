@@ -206,6 +206,55 @@ def test_fix_plan_allows_referenced_variable_definition_line() -> None:
     assert proposal.fixed_script.startswith("MAVEN_VERSION='3.8.6'\n")
 
 
+def test_fix_plan_accepts_model_anchor_without_block_indentation() -> None:
+    report = _report()
+    evidence = report.discrepancies[0].script[0]
+    evidence.line_start = 2
+    evidence.line_end = 3
+    evidence.commands = [
+        "sudo zypper install -y clang13 \\\n+    python cmake"
+    ]
+
+    class IndentationOmittingPlanProvider:
+        def generate(self, request: LLMRequest) -> LLMResponse:
+            return LLMResponse(
+                content=json.dumps(
+                    ScriptFixPlan(
+                        edits=[
+                            {
+                                "finding_id": "D-001",
+                                "start_line": 2,
+                                "end_line": 3,
+                                "original_text": (
+                                    "sudo zypper install -y clang13 \\\n+    python cmake"
+                                ),
+                                "replacement": (
+                                    "sudo zypper install -y clang7 \\\n+    python cmake"
+                                ),
+                            }
+                        ],
+                        summary="Align the Clang package with the Wiki.",
+                        rationale="The Wiki specifies clang7 for this dependency branch.",
+                        affected_finding_ids=["D-001"],
+                    ).model_dump()
+                )
+            )
+
+    proposal = generate_script_fix_proposal(
+        IndentationOmittingPlanProvider(),
+        report,
+        "#!/usr/bin/env bash\n"
+        "    sudo zypper install -y clang13 \\\n+"
+        "    python cmake\n",
+    )
+
+    assert proposal.fixed_script == (
+        "#!/usr/bin/env bash\n"
+        "    sudo zypper install -y clang7 \\\n+"
+        "    python cmake\n"
+    )
+
+
 def _unused_configuration_report() -> ComparisonReport:
     return ComparisonReport(
         package="Alfresco",

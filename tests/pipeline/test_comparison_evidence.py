@@ -334,6 +334,157 @@ def test_chunk_comparison_rematches_duplicate_bash_assignment() -> None:
     ]
 
 
+def test_chunk_comparison_recovers_when_duplicate_repair_repeats_source_id() -> None:
+    class DuplicateRepairKeepsUsingSourceIdProvider:
+        def __init__(self):
+            self.requests = []
+            self.responses = iter(
+                [
+                    {
+                        "summary": "The same Bash step was selected twice.",
+                        "matches": [
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-1",
+                                "bash_step_id": "candidate-1",
+                            },
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-2",
+                                "bash_step_id": "candidate-1",
+                            },
+                        ],
+                    },
+                    {
+                        "summary": "Repair failed.",
+                        "matches": [
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-2",
+                                "bash_step_id": "bash-1",
+                            }
+                        ],
+                    },
+                    {
+                        "summary": "Repair failed again.",
+                        "matches": [
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-2",
+                                "bash_step_id": "bash-1",
+                            }
+                        ],
+                    },
+                ]
+            )
+
+        def generate(self, request):
+            self.requests.append(request)
+            return LLMResponse(content=json.dumps(next(self.responses)))
+
+    wiki_steps = [
+        _step("wiki-1", "wiki", commands=["sudo yum install -y foo"]),
+        _step("wiki-2", "wiki", commands=["sudo zypper install -y foo"]),
+    ]
+    bash_steps = [
+        _step("bash-1", "bash", commands=["sudo yum install -y foo"]),
+        _step("bash-2", "bash", commands=["sudo zypper install -y foo"]),
+    ]
+    provider = DuplicateRepairKeepsUsingSourceIdProvider()
+
+    result = BuildPipeline(provider)._compare_in_chunks(
+        BuildInstruction(name="guide.md", source="wiki", steps=wiki_steps),
+        BuildInstruction(name="build.sh", source="build.sh", steps=bash_steps),
+        [_comparison_step(step) for step in wiki_steps],
+        [_comparison_step(step) for step in bash_steps],
+    )
+
+    assert result.valid
+    assert [match.automation_step.id for match in result.matches] == [
+        "bash-1",
+        "bash-2",
+    ]
+    assert len(provider.requests) == 3
+
+
+def test_chunk_comparison_repairs_omitted_wiki_rows_individually() -> None:
+    class PartialBatchProvider:
+        def __init__(self):
+            self.requests = []
+            self.responses = iter(
+                [
+                    {
+                        "summary": "Only the middle row was returned.",
+                        "matches": [
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-2",
+                                "bash_step_id": "candidate-2",
+                            }
+                        ],
+                    },
+                    {
+                        "summary": "The first row was repaired.",
+                        "matches": [
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-1",
+                                "bash_step_id": "candidate-1",
+                            }
+                        ],
+                    },
+                    {
+                        "summary": "The last row was repaired.",
+                        "matches": [
+                            {
+                                "status": "matched",
+                                "explanation": "The Bash action implements this Wiki action.",
+                                "wiki_step_id": "wiki-3",
+                                "bash_step_id": "candidate-1",
+                            }
+                        ],
+                    },
+                ]
+            )
+
+        def generate(self, request):
+            self.requests.append(request)
+            return LLMResponse(content=json.dumps(next(self.responses)))
+
+    wiki_steps = [
+        _step("wiki-1", "wiki", commands=["install first tool"]),
+        _step("wiki-2", "wiki", commands=["install second tool"]),
+        _step("wiki-3", "wiki", commands=["install third tool"]),
+    ]
+    bash_steps = [
+        _step("bash-1", "bash", commands=["install first tool"]),
+        _step("bash-2", "bash", commands=["install second tool"]),
+        _step("bash-3", "bash", commands=["install third tool"]),
+    ]
+    provider = PartialBatchProvider()
+
+    result = BuildPipeline(provider)._compare_in_chunks(
+        BuildInstruction(name="guide.md", source="wiki", steps=wiki_steps),
+        BuildInstruction(name="build.sh", source="build.sh", steps=bash_steps),
+        [_comparison_step(step) for step in wiki_steps],
+        [_comparison_step(step) for step in bash_steps],
+    )
+
+    assert result.valid
+    assert [match.automation_step.id for match in result.matches] == [
+        "bash-1",
+        "bash-2",
+        "bash-3",
+    ]
+    assert len(provider.requests) == 3
+
+
 def test_bash_candidates_use_local_ids_and_drop_unavailable_dependency_ids() -> None:
     candidate_steps, candidate_to_source = _alias_bash_candidates(
         [

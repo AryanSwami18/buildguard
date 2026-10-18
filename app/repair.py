@@ -237,14 +237,20 @@ def _apply_fix_plan(
             raise RuntimeError(
                 f"Edit for {edit.finding_id} has no original_text patch anchor."
             )
-        occurrences: list[tuple[int, int, int]] = []
+        occurrences: list[tuple[int, int, int, str]] = []
         search_from = 0
         while True:
             match_start = normalized_source.find(original_text, search_from)
             if match_start < 0:
                 break
             match_end = match_start + len(original_text)
-            starts_at_line = match_start == 0 or normalized_source[match_start - 1] == "\n"
+            line_start_offset = normalized_source.rfind("\n", 0, match_start) + 1
+            line_prefix = normalized_source[line_start_offset:match_start]
+            # Models often copy the semantic command from parsed evidence and
+            # omit only the function/branch indentation. That is still the
+            # same source block; the linked line range remains the safety
+            # boundary for the edit.
+            starts_at_line = not line_prefix.strip()
             ends_at_line = (
                 match_end == len(normalized_source)
                 or normalized_source[match_end - 1] == "\n"
@@ -258,7 +264,7 @@ def _apply_fix_plan(
                     actual_start <= end and actual_end >= start
                     for start, end in evidence_ranges
                 ):
-                    occurrences.append((match_start, actual_start, actual_end))
+                    occurrences.append((match_start, actual_start, actual_end, line_prefix))
             search_from = match_start + 1
         if len(occurrences) != 1:
             raise RuntimeError(
@@ -266,7 +272,7 @@ def _apply_fix_plan(
                 f"once within its linked Bash evidence; found {len(occurrences)} matches."
             )
 
-        match_start, actual_start, actual_end = occurrences[0]
+        match_start, actual_start, actual_end, line_prefix = occurrences[0]
         match_end = match_start + len(original_text)
 
         replacement_normalized = edit.replacement.replace("\r\n", "\n").replace("\r", "\n")
@@ -293,6 +299,12 @@ def _apply_fix_plan(
             len(source_lines),
             original_script.endswith(("\n", "\r")),
         )
+        if line_prefix and replacement_lines:
+            first_line_indent = replacement_lines[0][
+                : len(replacement_lines[0]) - len(replacement_lines[0].lstrip(" \t"))
+            ]
+            if not first_line_indent:
+                replacement_lines[0] = line_prefix + replacement_lines[0]
         resolved_edits.append((edit, actual_start, actual_end, replacement_lines))
 
     ordered_edits = sorted(resolved_edits, key=lambda item: (item[1], item[2]))

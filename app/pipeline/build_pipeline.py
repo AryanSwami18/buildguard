@@ -97,6 +97,16 @@ _COMPARISON_SEARCH_STOPWORDS = {
     "with",
 }
 
+_COMPARISON_PACKAGE_MANAGERS = {
+    "apt": "apt",
+    "apt-get": "apt",
+    "dnf": "dnf",
+    "yum": "yum",
+    "zypper": "zypper",
+    "apk": "apk",
+    "pacman": "pacman",
+}
+
 
 def _comparison_bash_ids(match: AIComparisonMatch) -> list[str]:
     """Normalize the legacy primary ID and the multi-step ID list."""
@@ -210,6 +220,16 @@ def _comparison_step_search_text(step: BuildStep) -> dict[str, Any]:
     }
 
 
+def _comparison_package_managers(step: BuildStep) -> set[str]:
+    """Return normalized package-manager commands used by one source step."""
+    command_text = "\n".join(step.commands).casefold()
+    return {
+        normalized
+        for command, normalized in _COMPARISON_PACKAGE_MANAGERS.items()
+        if re.search(rf"(?<![a-z0-9_-]){re.escape(command)}(?![a-z0-9_-])", command_text)
+    }
+
+
 def _comparison_candidate_score(wiki_step: BuildStep, bash_step: BuildStep) -> float:
     """Score one Bash step for a Wiki action without making a match decision."""
     wiki_fields = _comparison_step_search_text(wiki_step)
@@ -256,6 +276,19 @@ def _comparison_candidate_score(wiki_step: BuildStep, bash_step: BuildStep) -> f
         ActionType.RUN_TEST,
     }:
         score += 2
+
+    # A package command's manager identifies its platform branch.  Without
+    # this signal, yum, zypper, and apt dependency rows with mostly identical
+    # package names can all look interchangeable to retrieval and to a small
+    # local model.  Prefer the same manager and penalize a different manager;
+    # this does not decide the comparison, it only orders repair candidates.
+    wiki_managers = _comparison_package_managers(wiki_step)
+    bash_managers = _comparison_package_managers(bash_step)
+    if wiki_managers and bash_managers:
+        if wiki_managers & bash_managers:
+            score += 20
+        else:
+            score -= 12
 
     # A parameterized Bash operation is a strong candidate for a concrete
     # Wiki variant when its static package/tool tokens overlap.  The final AI
@@ -612,6 +645,19 @@ def _verified_value_differences(
     return verified
 
 
+def _comparison_scalar_values(value: Any) -> list[str]:
+    """Flatten a BuildStep field to source values suitable for evidence."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [item for nested in value.values() for item in _comparison_scalar_values(nested)]
+    if isinstance(value, (list, tuple, set)):
+        return [item for nested in value for item in _comparison_scalar_values(nested)]
+    if value is None:
+        return []
+    return [str(value)]
+
+
 class BuildPipeline:
     """Turns source structure plus context into validated common build steps."""
 
@@ -893,6 +939,7 @@ class BuildPipeline:
         bash_data_by_id: dict[str, dict[str, Any]],
         used_bash_ids: set[str],
         claimed_bash_ids: set[str],
+        duplicate_bash_id: str | None,
         bash_by_id: dict[str, BuildStep],
         comparison_prompt: str,
         batch_index: int,
@@ -905,15 +952,26 @@ class BuildPipeline:
         Rematching the affected row with claimed non-reusable steps removed
         preserves the valid rows and gives the model a clean ownership set.
         """
+        duplicate_ids = {duplicate_bash_id} if duplicate_bash_id is not None else set()
         blocked_bash_ids = {
             bash_id
-            for bash_id in used_bash_ids | claimed_bash_ids
+            for bash_id in used_bash_ids | claimed_bash_ids | duplicate_ids
             if not _is_reusable_comparison_step(bash_by_id[bash_id])
         }
         candidates = _select_comparison_bash_candidates(
             [wiki_step],
             bash.steps,
             blocked_bash_ids,
+        )
+        # Put the most semantically relevant unclaimed candidate first.  The
+        # aliases are intentionally local, and small local models frequently
+        # choose candidate-1 when several candidates are otherwise plausible.
+        # Ordering candidate-1 by evidence makes that fallback deterministic.
+        candidates.sort(
+            key=lambda step: (
+                -_comparison_candidate_score(wiki_step, step),
+                step.order,
+            )
         )
         candidate_data = [bash_data_by_id[step.id] for step in candidates]
         model_bash, candidate_to_source = _alias_bash_candidates(candidate_data)
@@ -957,6 +1015,215 @@ class BuildPipeline:
         if len(result.matches) != 1:
             return None, "the duplicate-assignment repair did not return one Wiki result"
         return result.matches[0], None
+
+    @staticmethod
+    def _fallback_missing_wiki_match(
+        wiki_step: BuildStep,
+        bash: BuildInstruction,
+        used_bash_ids: set[str],
+        claimed_bash_ids: set[str],
+        bash_by_id: dict[str, BuildStep],
+    ) -> AIComparisonMatch:
+        """Create a conservative result when a one-row repair is malformed."""
+        blocked_bash_ids = {
+            bash_id
+            for bash_id in used_bash_ids | claimed_bash_ids
+            if not _is_reusable_comparison_step(bash_by_id[bash_id])
+        }
+        candidates = _select_comparison_bash_candidates(
+            [wiki_step],
+            bash.steps,
+            blocked_bash_ids,
+        )
+        candidates.sort(
+            key=lambda step: (
+                -_comparison_candidate_score(wiki_step, step),
+                step.order,
+            )
+        )
+        candidate = candidates[0] if candidates else None
+        if candidate is not None and _comparison_candidate_score(wiki_step, candidate) >= 30:
+            return AIComparisonMatch(
+                status=MatchStatus.MATCHED,
+                explanation=(
+                    "The comparison response omitted this Wiki action; BuildGuard "
+                    f"recovered the strongest unclaimed semantic candidate ({candidate.id})."
+                ),
+                wiki_step_id=wiki_step.id,
+                bash_step_id=candidate.id,
+                bash_step_ids=[candidate.id],
+            )
+        return AIComparisonMatch(
+            status=MatchStatus.MISSING,
+            explanation=(
+                "The comparison response omitted this Wiki action and no unclaimed "
+                "Bash action had enough source evidence to recover it."
+            ),
+            wiki_step_id=wiki_step.id,
+            bash_step_id=None,
+            bash_step_ids=[],
+            category=DiscrepancyCategory.MISSING_STEP,
+            recommendation=(
+                "Review whether this Wiki action is implemented by an unclaimed "
+                "Bash operation."
+            ),
+        )
+
+    @staticmethod
+    def _fallback_duplicate_wiki_match(
+        original_match: AIComparisonMatch,
+        wiki_step: BuildStep,
+        bash: BuildInstruction,
+        used_bash_ids: set[str],
+        claimed_bash_ids: set[str],
+        duplicate_bash_id: str,
+        bash_by_id: dict[str, BuildStep],
+    ) -> AIComparisonMatch:
+        """Recover one duplicate row without re-offering its claimed node.
+
+        This path is deliberately last-resort.  It prevents a malformed local
+        model response from aborting an otherwise useful comparison, while
+        still refusing to invent a semantic match: a candidate must have
+        meaningful source overlap.  If no such candidate exists, the Wiki row
+        remains missing and is reported for review.
+        """
+        blocked_bash_ids = {
+            bash_id
+            for bash_id in used_bash_ids | claimed_bash_ids | {duplicate_bash_id}
+            if not _is_reusable_comparison_step(bash_by_id[bash_id])
+        }
+        candidates = _select_comparison_bash_candidates(
+            [wiki_step],
+            bash.steps,
+            blocked_bash_ids,
+        )
+        candidates.sort(
+            key=lambda step: (
+                -_comparison_candidate_score(wiki_step, step),
+                step.order,
+            )
+        )
+        candidate = candidates[0] if candidates else None
+        score = (
+            _comparison_candidate_score(wiki_step, candidate)
+            if candidate is not None
+            else 0.0
+        )
+        if candidate is None or score < 30:
+            return AIComparisonMatch(
+                status=MatchStatus.MISSING,
+                explanation=(
+                    "The comparison provider reused a Bash step and no unclaimed "
+                    "Bash action had enough source evidence to repair this row."
+                ),
+                wiki_step_id=wiki_step.id,
+                bash_step_id=None,
+                bash_step_ids=[],
+                category=DiscrepancyCategory.MISSING_STEP,
+                recommendation=(
+                    "Review whether this Wiki action is implemented by an "
+                    "unclaimed Bash operation."
+                ),
+            )
+
+        original_ids = _comparison_bash_ids(original_match)
+        if candidate.id in original_ids and candidate.id != duplicate_bash_id:
+            return AIComparisonMatch(
+                status=MatchStatus.MISSING,
+                explanation=(
+                    "The comparison provider reused a Bash step and the available "
+                    "candidates could not be assigned without another duplicate."
+                ),
+                wiki_step_id=wiki_step.id,
+                bash_step_id=None,
+                bash_step_ids=[],
+                category=DiscrepancyCategory.MISSING_STEP,
+                recommendation=(
+                    "Review whether this Wiki action is implemented by an "
+                    "unclaimed Bash operation."
+                ),
+            )
+        replacement_ids = [
+            candidate.id if bash_id == duplicate_bash_id else bash_id
+            for bash_id in original_ids
+        ]
+
+        repaired_differences: list[AIValueDifference] = []
+        for difference in original_match.value_differences:
+            difference_bash_id = (
+                candidate.id
+                if difference.bash_step_id == duplicate_bash_id
+                else difference.bash_step_id
+            )
+            bash_value = difference.bash_value
+            if difference.bash_step_id == duplicate_bash_id:
+                source_value = getattr(candidate, difference.field, None)
+                if source_value in (None, [], {}, ""):
+                    continue
+                source_values = _comparison_scalar_values(source_value)
+                source_value_by_key = {
+                    " ".join(value.split()).casefold(): value
+                    for value in source_values
+                }
+                original_value_key = " ".join(difference.bash_value.split()).casefold()
+                if original_value_key in source_value_by_key:
+                    bash_value = source_value_by_key[original_value_key]
+                else:
+                    wiki_values = {
+                        " ".join(value.split()).casefold()
+                        for value in _comparison_scalar_values(
+                            getattr(wiki_step, difference.field, None)
+                        )
+                    }
+                    changed_values = [
+                        value
+                        for value in source_values
+                        if " ".join(value.split()).casefold() not in wiki_values
+                    ]
+                    if not changed_values:
+                        continue
+                    bash_value = changed_values[0]
+            repaired_differences.append(
+                difference.model_copy(
+                    update={
+                        "bash_step_id": difference_bash_id,
+                        "bash_value": bash_value,
+                    }
+                )
+            )
+
+        status = original_match.status
+        category = original_match.category
+        recommendation = original_match.recommendation
+        if status == MatchStatus.CONFLICT and not _verified_value_differences(
+            repaired_differences,
+            wiki_step,
+            set(replacement_ids),
+            bash_by_id | {candidate.id: candidate},
+        ):
+            # Do not preserve a conflict whose old evidence belonged to the
+            # duplicate node.  The final validator will otherwise expose a
+            # conflict against the wrong Bash command.
+            status = MatchStatus.MATCHED
+            category = None
+            recommendation = None
+
+        primary_id = replacement_ids[0] if replacement_ids else candidate.id
+        return original_match.model_copy(
+            update={
+                "status": status,
+                "category": category,
+                "recommendation": recommendation,
+                "bash_step_id": primary_id,
+                "bash_step_ids": replacement_ids,
+                "value_differences": repaired_differences,
+                "explanation": (
+                    f"{original_match.explanation.strip()} BuildGuard reassigned "
+                    f"the duplicate Bash step to the strongest unclaimed semantic "
+                    f"candidate ({candidate.id})."
+                ),
+            }
+        )
 
     def _compare_in_chunks(
         self,
@@ -1055,7 +1322,110 @@ class BuildPipeline:
                     break
 
                 repair_wiki_id, issue_detail, duplicate_bash_id = validation_issue
+                if (
+                    repair_wiki_id is not None
+                    and duplicate_bash_id is None
+                    and issue_detail.startswith("the response omitted Wiki step(s):")
+                ):
+                    # A partial response is not a reason to throw away the
+                    # valid rows already returned by the model. Repair each
+                    # omitted Wiki action with its own small candidate set so
+                    # the provider cannot keep reproducing the same omission
+                    # from the full batch prompt.
+                    returned_wiki_ids = {
+                        match.wiki_step_id
+                        for match in batch_result.matches
+                        if match.wiki_step_id in expected_wiki_ids
+                    }
+                    omitted_steps = [
+                        step
+                        for step in wiki_batch_steps
+                        if step.id not in returned_wiki_ids
+                    ]
+                    for omitted_step in omitted_steps:
+                        claimed_bash_ids = {
+                            claimed_id
+                            for match in batch_result.matches
+                            if match.wiki_step_id in expected_wiki_ids
+                            for claimed_id in _comparison_bash_ids(match)
+                        }
+                        repaired_match, repair_error = self._repair_duplicate_wiki_match(
+                            omitted_step,
+                            wiki_data_by_id[omitted_step.id],
+                            bash,
+                            bash_data_by_id,
+                            used_bash_ids,
+                            claimed_bash_ids,
+                            None,
+                            bash_by_id,
+                            comparison_prompt,
+                            batch_index,
+                        )
+                        if repaired_match is None:
+                            repaired_match = self._fallback_missing_wiki_match(
+                                omitted_step,
+                                bash,
+                                used_bash_ids,
+                                claimed_bash_ids,
+                                bash_by_id,
+                            )
+                            if self.progress is not None:
+                                self.progress(
+                                    f"Recovered omitted Wiki step {omitted_step.id} "
+                                    "without another full-batch retry."
+                                )
+                        batch_result = batch_result.model_copy(
+                            update={
+                                "matches": [
+                                    *batch_result.matches,
+                                    repaired_match,
+                                ]
+                            }
+                        )
+                    continue
+
                 if repair_attempts >= COMPARISON_BATCH_REPAIR_ATTEMPTS:
+                    if duplicate_bash_id is not None and repair_wiki_id is not None:
+                        original_match = next(
+                            match
+                            for match in batch_result.matches
+                            if match.wiki_step_id == repair_wiki_id
+                        )
+                        claimed_bash_ids = {
+                            claimed_id
+                            for match in batch_result.matches
+                            if match.wiki_step_id != repair_wiki_id
+                            for claimed_id in _comparison_bash_ids(match)
+                        }
+                        fallback_match = self._fallback_duplicate_wiki_match(
+                            original_match,
+                            next(
+                                step
+                                for step in wiki_batch_steps
+                                if step.id == repair_wiki_id
+                            ),
+                            bash,
+                            used_bash_ids,
+                            claimed_bash_ids,
+                            duplicate_bash_id,
+                            bash_by_id,
+                        )
+                        batch_result = batch_result.model_copy(
+                            update={
+                                "matches": [
+                                    fallback_match
+                                    if match.wiki_step_id == repair_wiki_id
+                                    else match
+                                    for match in batch_result.matches
+                                ]
+                            }
+                        )
+                        if self.progress is not None:
+                            self.progress(
+                                f"Recovered comparison batch {batch_index} after "
+                                f"duplicate Bash assignment for {repair_wiki_id}."
+                            )
+                        continue
                     target = f"Wiki step {repair_wiki_id}" if repair_wiki_id else "the batch"
                     raise RuntimeError(
                         f"AI comparison batch {batch_index} could not validate "
@@ -1088,6 +1458,7 @@ class BuildPipeline:
                         bash_data_by_id,
                         used_bash_ids,
                         claimed_bash_ids,
+                        duplicate_bash_id,
                         bash_by_id,
                         comparison_prompt,
                         batch_index,
@@ -1106,6 +1477,13 @@ class BuildPipeline:
                         continue
                     if repair_error:
                         issue_detail = repair_error
+
+                    # Do not send the original full batch again: it still
+                    # contains the duplicate candidate and invites the model
+                    # to reproduce the same ownership error.  The next loop
+                    # iteration retries only the affected Wiki row with the
+                    # claimed candidate removed.
+                    continue
 
                 repair_request = LLMRequest(
                     system_prompt=comparison_prompt,
